@@ -7,7 +7,27 @@ using RPG.Network;
 using System.Collections;
 
 namespace RPG.UI
-
+{
+    /// <summary>
+    /// PowerGemUI — Janela de encaixe das Joias do Poder (tecla P).
+    ///
+    /// === MUDANÇAS DESTA VERSÃO (Lote 5 — robustez) ===
+    ///
+    ///   1. RE-VALIDAÇÃO NO CLIQUE DO SLOT (equip mode):
+    ///      Antes, OpenForEquip validava o item UMA VEZ na abertura. Mas
+    ///      entre a abertura e o clique no slot Q/W/E/R, o player podia
+    ///      descartar o item (via outra UI), morrer e dropar, etc.
+    ///      Agora revalidamos no OnGemSlotClicked ANTES de chamar CmdEquipGem.
+    ///
+    ///   2. FECHA AUTOMATICAMENTE SE INVENTORY MUDA EM EQUIP MODE:
+    ///      Subscreve em OnInventoryChanged enquanto estiver em equip mode.
+    ///      Se o item de origem sumir do inventário, fecha a janela
+    ///      automaticamente com mensagem informativa.
+    ///
+    ///   3. UNSUBSCRIBE COMPLETO EM OnDestroy E Close:
+    ///      Antes, OnDestroy só desinscrevia OnGemLoadoutChanged. Agora também
+    ///      desinscreve OnInventoryChanged (subscrito em equip mode).
+    /// </summary>
     public class PowerGemUI : MonoBehaviour
     {
         public static PowerGemUI Instance { get; private set; }
