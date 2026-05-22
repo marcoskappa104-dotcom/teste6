@@ -134,7 +134,24 @@ namespace RPG.Managers
         }
     }
 
-
+    /// <summary>
+    /// Persistência em SQLite. Compila integralmente apenas em UNITY_SERVER.
+    ///
+    /// === MUDANÇAS DESTA VERSÃO (Quest persistence) ===
+    ///
+    ///   1. NOVA TABELA quest_progress:
+    ///      Armazena estado e progresso de cada quest por personagem.
+    ///      CreateTable é idempotente — bancos existentes ganham a tabela
+    ///      automaticamente no próximo boot. Nenhuma migração manual.
+    ///
+    ///   2. LoadQuestProgress / SaveQuestProgress:
+    ///      Mesmo padrão dos outros métodos (snapshot + EnqueueWrite).
+    ///      Save é assíncrono via write-thread; load é síncrono.
+    ///
+    ///   3. DRAIN GARANTIDO EM SHUTDOWN preservado:
+    ///      A infra de FlushAndClose continua igual; novos saves entram
+    ///      no mesmo write-thread já existente.
+    /// </summary>
     public class DatabaseManager : MonoBehaviour
     {
         public static DatabaseManager Instance { get; private set; }
