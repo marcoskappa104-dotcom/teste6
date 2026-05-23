@@ -45,8 +45,14 @@ namespace RPG.Network
             public float LastAttemptTime;
         }
 
-        private readonly Dictionary<int, ConnData>  _sessions = new();
-        private readonly Dictionary<string, IpData> _ipBans   = new();
+        private readonly Dictionary<int, ConnData>    _sessions       = new();
+        private readonly Dictionary<string, IpData>   _ipBans         = new();
+
+        // ── PROTEÇÃO CONTRA LOGIN DUPLO ────────────────────────────────────
+        // Mapeia username (lowercase) → connectionId que está usando essa conta.
+        // Quando a conexão cai (OnServerDisconnect), o username é removido.
+        private readonly Dictionary<string, int>      _loggedAccounts = new();
+
         private Coroutine _cleanupCoroutine;
 
         private const float CLEANUP_INTERVAL = 60f;
@@ -112,9 +118,24 @@ namespace RPG.Network
 
         public void OnServerDisconnect(NetworkConnectionToClient conn)
         {
-            // FIX: Remove a sessão independente do estado (incluindo InGame).
-            // Antes a limpeza periódica pulava sessões InGame com `continue`,
-            // causando acúmulo de entradas órfãs de jogadores que desconectaram.
+            if (_sessions.TryGetValue(conn.connectionId, out var session))
+            {
+                // ── LIBERA O SLOT DA CONTA AO DESCONECTAR ─────────────────
+                // Independente do estado (Authenticated ou InGame), se havia
+                // um username associado, remove do dicionário de contas logadas
+                // para que o jogador possa entrar novamente.
+                if (!string.IsNullOrEmpty(session.Username))
+                {
+                    string key = session.Username.ToLower();
+                    if (_loggedAccounts.TryGetValue(key, out int registeredConnId)
+                        && registeredConnId == conn.connectionId)
+                    {
+                        _loggedAccounts.Remove(key);
+                        LogAuth($"Conta '{session.Username}' liberada (connId={conn.connectionId} desconectou).");
+                    }
+                }
+            }
+
             _sessions.Remove(conn.connectionId);
         }
 
@@ -180,6 +201,34 @@ namespace RPG.Network
                 return;
             }
 
+            // ── VERIFICAÇÃO DE CONTA JÁ LOGADA ────────────────────────────
+            // Antes de consultar o banco, verifica se alguém já está usando
+            // esta conta. Se sim, rejeita imediatamente.
+            string usernameLower = msg.Username.Trim().ToLower();
+            if (_loggedAccounts.TryGetValue(usernameLower, out int existingConnId))
+            {
+                // Verifica se a conexão registrada ainda está ativa
+                bool existingStillActive = NetworkServer.connections.ContainsKey(existingConnId);
+
+                if (existingStillActive)
+                {
+                    Debug.LogWarning($"[ServerAuth] SECURITY: conta '{msg.Username}' já está logada " +
+                                     $"(connId={existingConnId}). Rejeitando nova tentativa de connId={conn.connectionId}.");
+                    conn.Send(new MsgLoginResponse
+                    {
+                        Success = false,
+                        Error   = "Esta conta já está em uso. Feche o jogo no outro dispositivo antes de entrar."
+                    });
+                    return;
+                }
+                else
+                {
+                    // Conexão antiga não existe mais — limpa o registro órfão
+                    _loggedAccounts.Remove(usernameLower);
+                    LogAuth($"Registro órfão de conta '{msg.Username}' removido (connId={existingConnId} não existe mais).");
+                }
+            }
+
             LoginAttemptResult result = default;
             if (DatabaseManager.Instance != null)
                 result = DatabaseManager.Instance.TryLoginWithSignedHash(
@@ -202,6 +251,9 @@ namespace RPG.Network
                     conn.Send(failMsg);
                 return;
             }
+
+            // ── REGISTRA A CONTA COMO LOGADA ──────────────────────────────
+            _loggedAccounts[usernameLower] = conn.connectionId;
 
             session.State            = ConnState.Authenticated;
             session.Username         = result.Account.Username;
@@ -331,7 +383,7 @@ namespace RPG.Network
 
         /// <summary>
         /// Limpeza forçada de sessões não-InGame expiradas.
-        /// FIX: não tenta mais limpar InGame aqui — OnServerDisconnect já cuida disso.
+        /// Não remove sessões InGame — essas saem em OnServerDisconnect.
         /// </summary>
         private void ForceCleanupSessions()
         {
@@ -340,8 +392,6 @@ namespace RPG.Network
 
             foreach (var kv in _sessions)
             {
-                // FIX: só remove sessões que NÃO são InGame — as InGame são removidas
-                // imediatamente em OnServerDisconnect, então não precisam de limpeza aqui.
                 if (kv.Value.State == ConnState.InGame) continue;
 
                 float threshold = GameConstants.Auth.SESSION_TTL_SECONDS * 0.5f;
@@ -350,7 +400,17 @@ namespace RPG.Network
             }
 
             foreach (var id in toRemove)
+            {
+                // Libera conta se havia username registrado
+                var s = _sessions[id];
+                if (!string.IsNullOrEmpty(s.Username))
+                {
+                    string key = s.Username.ToLower();
+                    if (_loggedAccounts.TryGetValue(key, out int cid) && cid == id)
+                        _loggedAccounts.Remove(key);
+                }
                 _sessions.Remove(id);
+            }
 
             if (toRemove.Count > 0)
                 Debug.Log($"[ServerAuth] ForceCleanup removeu {toRemove.Count} sessões ociosas.");
@@ -584,12 +644,6 @@ namespace RPG.Network
         // Limpeza periódica
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// FIX: A limpeza periódica agora remove APENAS sessões não-InGame expiradas.
-        /// Sessões InGame são removidas imediatamente em OnServerDisconnect.
-        /// Isso elimina o acúmulo de entradas órfãs que antes permaneciam em
-        /// _sessions para sempre quando um jogador desconectava em estado InGame.
-        /// </summary>
         private IEnumerator CleanupExpiredSessions()
         {
             var wait            = new WaitForSeconds(CLEANUP_INTERVAL);
@@ -603,8 +657,7 @@ namespace RPG.Network
                 expiredSessions.Clear();
                 foreach (var kv in _sessions)
                 {
-                    // Apenas sessões fora de jogo expiram pelo tempo —
-                    // as InGame saem imediatamente em OnServerDisconnect.
+                    // Sessões InGame saem em OnServerDisconnect — não limpar aqui.
                     if (kv.Value.State == ConnState.InGame) continue;
 
                     if (Time.time - kv.Value.LastActivityTime > GameConstants.Auth.SESSION_TTL_SECONDS)
@@ -612,9 +665,18 @@ namespace RPG.Network
                 }
                 foreach (var id in expiredSessions)
                 {
-                    var state = _sessions[id].State;
+                    var s = _sessions[id];
+
+                    // Libera conta se havia username registrado
+                    if (!string.IsNullOrEmpty(s.Username))
+                    {
+                        string key = s.Username.ToLower();
+                        if (_loggedAccounts.TryGetValue(key, out int cid) && cid == id)
+                            _loggedAccounts.Remove(key);
+                    }
+
                     _sessions.Remove(id);
-                    Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id} estado={state}");
+                    Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id} estado={s.State}");
                 }
 
                 expiredIps.Clear();
@@ -630,6 +692,59 @@ namespace RPG.Network
 
                 if (_ipBans.Count > MAX_TRACKED_IPS)
                     EvictLeastRecentIps(targetSize: MAX_TRACKED_IPS - (MAX_TRACKED_IPS / 10));
+
+                // ── LIMPEZA DE CONTAS LOGADAS ÓRFÃS ───────────────────────
+                // Verifica se algum connId em _loggedAccounts não existe mais
+                // como conexão ativa. Isso é uma rede de segurança extra — em
+                // condições normais OnServerDisconnect já cuida disso.
+                var orphanedAccounts = new List<string>();
+                foreach (var kv in _loggedAccounts)
+                {
+                    if (!NetworkServer.connections.ContainsKey(kv.Value))
+                        orphanedAccounts.Add(kv.Key);
+                }
+                foreach (var username in orphanedAccounts)
+                {
+                    _loggedAccounts.Remove(username);
+                    Debug.LogWarning($"[ServerAuth] Conta logada órfã removida na limpeza periódica: '{username}'");
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // API pública — utilitário de debug/admin (opcional)
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Retorna true se a conta (username) está atualmente logada.
+        /// Útil para sistemas de admin ou debug.
+        /// </summary>
+        public bool IsAccountOnline(string username)
+        {
+            if (string.IsNullOrEmpty(username)) return false;
+            return _loggedAccounts.ContainsKey(username.ToLower());
+        }
+
+        /// <summary>
+        /// Força o kick de uma conta pelo username (para uso admin/anti-cheat).
+        /// </summary>
+        public void KickAccount(string username, string reason = "Desconectado pelo servidor.")
+        {
+            if (string.IsNullOrEmpty(username)) return;
+            string key = username.ToLower();
+
+            if (!_loggedAccounts.TryGetValue(key, out int connId)) return;
+
+            if (NetworkServer.connections.TryGetValue(connId, out var conn))
+            {
+                conn.Send(new MsgErrorResponse { Error = reason });
+                conn.Disconnect();
+                Debug.Log($"[ServerAuth] Conta '{username}' foi kickada. Motivo: {reason}");
+            }
+            else
+            {
+                // Conexão não existe mais — remove o registro órfão
+                _loggedAccounts.Remove(key);
             }
         }
     }
