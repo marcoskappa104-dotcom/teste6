@@ -342,6 +342,9 @@ namespace RPG.Combat
 
             if (effectiveCastTime <= INSTANT_CAST_EPS)
             {
+                // FIX: dispara animação via RPC para todos os clientes verem
+                PlaySkillAnimation(skill.AnimTrigger);
+
                 if (isSelf) SendSelfSkillCmd(index);
                 else        SendSkillCmd(index, target, skill.Type == SkillType.Physical);
                 return;
@@ -360,8 +363,9 @@ namespace RPG.Combat
 
             StopAgent();
 
+            // FIX: animação de cast via RPC — todos os clientes veem
             if (!string.IsNullOrEmpty(skill.AnimTrigger))
-                _animator?.SetTrigger("CastStart");
+                PlaySkillAnimation("CastStart");
 
             float elapsed   = 0f;
             bool  cancelled = false;
@@ -395,6 +399,9 @@ namespace RPG.Combat
 
             if (!cancelled)
             {
+                // FIX: animação de release via RPC
+                PlaySkillAnimation(skill.AnimTrigger);
+
                 if (isSelf) SendSelfSkillCmd(index);
                 else        SendSkillCmd(index, target, skill.Type == SkillType.Physical);
             }
@@ -420,7 +427,6 @@ namespace RPG.Combat
             {
                 timeout -= Time.deltaTime;
 
-                // FIX: verificação de morte dentro do loop — cancela imediatamente
                 if (_player.IsDead)
                 {
                     Log("Walk: player morreu.");
@@ -484,7 +490,6 @@ namespace RPG.Combat
 
                 yield return null;
 
-                // FIX: verificação explícita de IsDead antes de executar skill
                 if (!_player.IsDead && IsTargetValid(target) && _player.CurrentTarget == target)
                 {
                     Log($"Em range. Executando skill {index}.");
@@ -547,9 +552,6 @@ namespace RPG.Combat
             var skill = GetSkill(skillIndex);
             StopAgent();
 
-            if (_animator != null && skill != null && !string.IsNullOrEmpty(skill.AnimTrigger))
-                _animator.SetTrigger(skill.AnimTrigger);
-
             if (target != null)
             {
                 Vector3 dir = target.Position - transform.position;
@@ -583,6 +585,25 @@ namespace RPG.Combat
         {
             _netPlayer?.CmdRequestSelfSkill(skillIndex);
             Log($"CmdRequestSelfSkill skill:{skillIndex}");
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // FIX: Animação via RPC — todos os clientes veem a animação
+        // ══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Dispara uma animação localmente E via RPC para todos os clientes.
+        /// Usa o NetworkPlayer.RpcPlayAnimation que já existe no código.
+        /// </summary>
+        private void PlaySkillAnimation(string triggerName)
+        {
+            if (string.IsNullOrEmpty(triggerName)) return;
+
+            // Aplica localmente no cliente local (para resposta imediata)
+            _animator?.SetTrigger(triggerName);
+
+            // Envia via RPC para todos os outros clientes verem a animação
+            _netPlayer?.RpcPlayAnimation(triggerName);
         }
 
         // ══════════════════════════════════════════════════════════════════
