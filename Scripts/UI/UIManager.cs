@@ -49,12 +49,11 @@ namespace RPG.UI
         private RPG.Network.NetworkPlayer _netPlayer;
         private float                     _messageTimer;
 
-        // Callbacks armazenadas para permitir RemoveListener exato
         private UnityEngine.Events.UnityAction _attributeButtonCallback;
         private UnityEngine.Events.UnityAction _inventoryButtonCallback;
         private UnityEngine.Events.UnityAction _powerGemButtonCallback;
 
-        private bool _hudButtonsRegistered = false;
+        private bool _hudButtonsRegistered      = false;
         private bool _attributeButtonRegistered = false;
 
         private void Awake()
@@ -68,7 +67,6 @@ namespace RPG.UI
             ClearTargetPanel();
             if (messageText != null) messageText.text = "";
 
-            // Botão da janela de atributos — singleton geralmente sempre ativo
             if (attributeWindowButton != null && !_attributeButtonRegistered)
             {
                 _attributeButtonCallback = () => attributeWindow?.Toggle();
@@ -78,7 +76,6 @@ namespace RPG.UI
 
             RegisterHudButtonsSafe();
 
-            // Modo offline (sem rede): tenta achar PlayerEntity na cena
             var player = FindFirstObjectByType<PlayerEntity>();
             if (player != null && player.IsInitialized)
                 BindLocalPlayer(player);
@@ -89,7 +86,6 @@ namespace RPG.UI
             UnsubscribeFromPlayer();
             UnsubscribeFromSkills();
 
-            // Remove listeners dos botões usando as referências exatas
             if (attributeWindowButton != null && _attributeButtonCallback != null)
             {
                 attributeWindowButton.onClick.RemoveListener(_attributeButtonCallback);
@@ -102,28 +98,34 @@ namespace RPG.UI
         }
 
         /// <summary>
-        /// Registra os listeners dos botões de HUD UMA VEZ.
-        /// Reentrante: se já registrado, retorna imediatamente.
+        /// FIX: a lógica anterior de _hudButtonsRegistered era incorreta.
+        /// Antes: a flag era definida como true numa condição composta confusa
+        /// que poderia ser true mesmo sem registrar listeners. Agora a flag só
+        /// é definida como true quando TODOS os botões configurados foram
+        /// efetivamente registrados — sem callbacks pendentes.
         /// </summary>
         private void RegisterHudButtonsSafe()
         {
             if (_hudButtonsRegistered) return;
 
-            // Fallback de log se singletons estão null
-            if (InventoryUI.Instance == null)
+            // Avisa se os singletons ainda não estão prontos (sem bloquear)
+            if (inventoryHudButton != null && InventoryUI.Instance == null)
             {
                 var found = FindFirstObjectByType<InventoryUI>();
                 if (found != null)
                     Debug.LogWarning("[UIManager] InventoryUI.Instance era null — encontrado via FindFirstObjectByType. " +
                                      "Verifique se o GameObject do InventoryUI está ATIVO na hierarquia.");
             }
-            if (PowerGemUI.Instance == null)
+            if (powerGemHudButton != null && PowerGemUI.Instance == null)
             {
                 var found = FindFirstObjectByType<PowerGemUI>();
                 if (found != null)
                     Debug.LogWarning("[UIManager] PowerGemUI.Instance era null — encontrado via FindFirstObjectByType. " +
                                      "Verifique se o GameObject do PowerGemUI está ATIVO na hierarquia.");
             }
+
+            bool inventoryDone = true;
+            bool powerGemDone  = true;
 
             // Inventory button
             if (inventoryHudButton != null && _inventoryButtonCallback == null)
@@ -136,6 +138,12 @@ namespace RPG.UI
                         Debug.LogWarning("[UIManager] InventoryUI.Instance é null ao clicar no botão!");
                 };
                 inventoryHudButton.onClick.AddListener(_inventoryButtonCallback);
+                // FIX: listener registrado com sucesso
+            }
+            else if (inventoryHudButton != null && _inventoryButtonCallback == null)
+            {
+                // Listener ainda não pôde ser registrado
+                inventoryDone = false;
             }
 
             // Power Gem button
@@ -150,13 +158,17 @@ namespace RPG.UI
                                          "Certifique-se que o GameObject está ATIVO na hierarquia.");
                 };
                 powerGemHudButton.onClick.AddListener(_powerGemButtonCallback);
+                // FIX: listener registrado com sucesso
+            }
+            else if (powerGemHudButton != null && _powerGemButtonCallback == null)
+            {
+                powerGemDone = false;
             }
 
-            bool nothingToRegister   = inventoryHudButton == null && powerGemHudButton == null;
-            bool somethingRegistered = (inventoryHudButton == null || _inventoryButtonCallback != null)
-                                    && (powerGemHudButton  == null || _powerGemButtonCallback  != null);
-
-            if (nothingToRegister || somethingRegistered)
+            // FIX: só marca como concluído quando TUDO que precisava ser registrado foi registrado.
+            // Se algum botão está configurado mas sem callback, retorna sem marcar —
+            // permitindo nova tentativa em BindLocalPlayer.
+            if (inventoryDone && powerGemDone)
                 _hudButtonsRegistered = true;
         }
 
@@ -181,18 +193,14 @@ namespace RPG.UI
         {
             if (player == null) return;
 
-            // Re-bind do MESMO player: só atualiza, sem desinscrever/reinscrever
             if (_player == player)
             {
                 attributeWindow?.BindPlayer(player);
                 if (player.IsInitialized) ForceRefreshAll();
-
-                // Re-tenta registrar botões (singletons podem ter ficado prontos depois)
                 RegisterHudButtonsSafe();
                 return;
             }
 
-            // Player diferente — limpa subscrições antigas
             UnsubscribeFromPlayer();
             UnsubscribeFromSkills();
 

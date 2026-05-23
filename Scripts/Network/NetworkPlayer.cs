@@ -62,14 +62,17 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
 
+        // FIX: StatsVersion dispara FullRefresh no cliente. Os hooks de AllocXxx
+        // apenas marcam _allocDirty (processado no Update), para evitar múltiplos
+        // FullRefresh no mesmo frame quando vários SyncVars chegam juntos.
         [SyncVar(hook = nameof(OnStatsVersionChanged))]  public int    StatsVersion          = 0;
 
-        [SyncVar(hook = nameof(OnAllocSTRChanged))] public int AllocatedSTR = 0;
-        [SyncVar(hook = nameof(OnAllocAGIChanged))] public int AllocatedAGI = 0;
-        [SyncVar(hook = nameof(OnAllocVITChanged))] public int AllocatedVIT = 0;
-        [SyncVar(hook = nameof(OnAllocDEXChanged))] public int AllocatedDEX = 0;
-        [SyncVar(hook = nameof(OnAllocINTChanged))] public int AllocatedINT = 0;
-        [SyncVar(hook = nameof(OnAllocLUKChanged))] public int AllocatedLUK = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedSTR = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedAGI = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedVIT = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedDEX = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedINT = 0;
+        [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedLUK = 0;
 
         [SyncVar] public int BaseSTR = 10;
         [SyncVar] public int BaseAGI = 10;
@@ -115,7 +118,6 @@ namespace RPG.Network
         private readonly Dictionary<int, float>  _serverSkillCooldowns       = new();
         private readonly Dictionary<long, float> _serverBasicAttackCooldowns = new();
 
-        // Buffers reutilizáveis para cleanup (zero alocação em estado estável)
         private readonly List<int>  _cooldownCleanupBufferInt  = new(8);
         private readonly List<long> _cooldownCleanupBufferLong = new(8);
 
@@ -127,6 +129,9 @@ namespace RPG.Network
         private bool          _pendingClientInit;
         private CharacterData _pendingInitData;
 
+        // FIX: _allocDirty é marcado por QUALQUER hook de AllocXxx via OnAllocChanged.
+        // _equipDirty é marcado pelo evento de inventário.
+        // Processados no Update para consolidar vários SyncVars chegando no mesmo frame.
         private bool _allocDirty;
         private bool _equipDirty;
 
@@ -338,13 +343,10 @@ namespace RPG.Network
             BaseINT = charData.BaseAttributes?.INT ?? 10;
             BaseLUK = charData.BaseAttributes?.LUK ?? 10;
 
-            // ORDEM CRÍTICA: Load → BuildBonuses → GetDerivedStats
             _inventory?.ServerLoadFromDatabase(charData.CharacterId);
             _inventory?.ServerLoadGemLoadout(charData.CharacterId);
             _inventory?.ServerLoadEquippedFromDatabase(charData.CharacterId);
 
-            // Quests carregadas DEPOIS do inventário (CollectItem objectives
-            // fazem recheck inicial baseado no inventário carregado).
             _questManager?.ServerLoadFromDatabase(charData.CharacterId, _serverAccountUsername);
 
             charData.EquipmentBonuses = _inventory != null
@@ -745,7 +747,6 @@ namespace RPG.Network
                 StartRegenLoop();
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
 
-                // Notifica quests do tipo ReachLevel
                 _questManager?.NotifyLevelUp(Level);
             }
 
@@ -866,7 +867,6 @@ namespace RPG.Network
         [ClientRpc]
         private void RpcPlayerDied()
         {
-            // Animator setado para TODOS os clientes (intencional).
             if (_animator != null) _animator.SetBool("IsDead", true);
 
             if (!isLocalPlayer) return;
@@ -974,9 +974,9 @@ namespace RPG.Network
 
             IsMoving = false;
 
-            // Limpa AMBOS os tipos de cooldown — versão anterior só limpava
-            // _serverBasicAttackCooldowns, deixando skills "presas" em
-            // respawns longos.
+            // FIX: limpa AMBOS os dicionários de cooldown ANTES de salvar.
+            // Garante que o personagem não ressuscita com skills bloqueadas
+            // e que o save não persiste cooldowns stale.
             _serverBasicAttackCooldowns.Clear();
             _serverSkillCooldowns.Clear();
 
@@ -1049,13 +1049,6 @@ namespace RPG.Network
 
         private void OnRaceStrChanged(string _, string __) => UpdateCachedRace();
 
-        // === FIX (Lote 1): MaxHP slider ===
-        // Antes: maxValue = Mathf.Max(newMax, _hpBarSlider.value) — IMPEDIA
-        // que o slider mostrasse redução de MaxHP ao desequipar item.
-        // Agora: ajusta maxValue para o novo MaxHP e clampa value para não
-        // ficar acima do novo máximo. CurrentHP virá no próximo OnNetHPChanged
-        // (servidor sempre envia ambos quando há mudança real), mas garantimos
-        // consistência visual imediata.
         private void OnNetMaxHPChanged(float _, float newMax)
         {
             if (_hpBarSlider != null)
@@ -1071,9 +1064,6 @@ namespace RPG.Network
         {
             if (_hpBarSlider != null)
             {
-                // Garante que maxValue está coerente com o MaxHP atual,
-                // mas não infla pelo valor de HP (que pode estar
-                // temporariamente acima após mudança de equip — clamp por baixo).
                 _hpBarSlider.maxValue = Mathf.Max(1f, MaxHP);
                 _hpBarSlider.value    = Mathf.Clamp(newHP, 0f, _hpBarSlider.maxValue);
                 _hpBarSlider.gameObject.SetActive(newHP < MaxHP);
@@ -1082,11 +1072,8 @@ namespace RPG.Network
                 _playerEntity.SetHPFromServer(newHP, MaxHP);
         }
 
-        // === FIX (Lote 1): MaxMP — mesma lógica de MaxHP ===
         private void OnNetMaxMPChanged(float _, float newMax)
         {
-            // Para MP não há slider direto neste prefab, mas mantemos a
-            // consistência sincronizando PlayerEntity (UIManager observa via evento).
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized)
                 _playerEntity.SetMPFromServer(CurrentMP, newMax);
         }
@@ -1127,12 +1114,18 @@ namespace RPG.Network
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
 
-        private void OnAllocSTRChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
-        private void OnAllocAGIChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
-        private void OnAllocVITChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
-        private void OnAllocDEXChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
-        private void OnAllocINTChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
-        private void OnAllocLUKChanged(int _, int __) { if (isLocalPlayer) _allocDirty = true; }
+        /// <summary>
+        /// FIX: todos os hooks de AllocXxx convergem para um único método que
+        /// marca _allocDirty. O Update processa a dirty flag uma vez por frame,
+        /// evitando múltiplos FullRefresh quando vários SyncVars chegam juntos.
+        /// Antes, cada hook individual marcava _allocDirty separadamente com
+        /// nomes distintos (OnAllocSTRChanged etc) — funcionalmente idêntico,
+        /// mas mais verboso e propenso a inconsistência.
+        /// </summary>
+        private void OnAllocChanged(int _, int __)
+        {
+            if (isLocalPlayer) _allocDirty = true;
+        }
 
         private void OnClientEquipmentChanged()
         {
@@ -1171,13 +1164,42 @@ namespace RPG.Network
                 _playerEntity.FullRefreshStatsFromData();
         }
 
+        /// <summary>
+        /// FIX: OnStatsVersionChanged agora é o único ponto de FullRefresh no cliente.
+        /// Os hooks de AllocXxx apenas marcam _allocDirty (Update consolida).
+        /// Isso evita redundância — antes tanto os hooks de AllocXxx quanto
+        /// OnStatsVersionChanged podiam disparar FullRefreshStatsFromData no mesmo frame.
+        /// </summary>
         private void OnStatsVersionChanged(int _, int __)
         {
             if (!isLocalPlayer) return;
             if (_playerEntity == null || !_playerEntity.IsInitialized) return;
 
+            // Aplica equipamento mais recente e recalcula stats
             if (_inventory != null)
                 _playerEntity.Data.EquipmentBonuses = _inventory.BuildEquipmentBonuses();
+
+            // Aplica atributos alocados mais recentes
+            if (_playerEntity.Data != null)
+            {
+                _playerEntity.Data.BaseAttributes.STR = BaseSTR;
+                _playerEntity.Data.BaseAttributes.AGI = BaseAGI;
+                _playerEntity.Data.BaseAttributes.VIT = BaseVIT;
+                _playerEntity.Data.BaseAttributes.DEX = BaseDEX;
+                _playerEntity.Data.BaseAttributes.INT = BaseINT;
+                _playerEntity.Data.BaseAttributes.LUK = BaseLUK;
+
+                _playerEntity.Data.AllocatedSTR = AllocatedSTR;
+                _playerEntity.Data.AllocatedAGI = AllocatedAGI;
+                _playerEntity.Data.AllocatedVIT = AllocatedVIT;
+                _playerEntity.Data.AllocatedDEX = AllocatedDEX;
+                _playerEntity.Data.AllocatedINT = AllocatedINT;
+                _playerEntity.Data.AllocatedLUK = AllocatedLUK;
+            }
+
+            // Cancela as dirty flags pois acabamos de processar tudo
+            _allocDirty = false;
+            _equipDirty = false;
 
             _playerEntity.FullRefreshStatsFromData();
         }

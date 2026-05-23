@@ -35,13 +35,9 @@ namespace RPG.Network
         // ── Estado do servidor ─────────────────────────────────────────────
         private int           _nextSlotIndex;
         private NetworkPlayer _netPlayer;
-
-        // Cache do QuestManager para evitar GetComponent repetido
         private RPG.Quest.QuestManager _questManager;
 
-        // === FIX (Lote 1): "purgatório" de itens perdidos por falhas catastróficas ===
-        // Lista server-side de itens que precisam ser devolvidos ao jogador
-        // assim que houver espaço. Persiste em memória entre saves.
+        // Purgatório de itens que não couberam durante swap
         private readonly List<(string itemId, int quantity)> _pendingReturns = new();
 
         // ── Lifecycle ──────────────────────────────────────────────────────
@@ -125,12 +121,6 @@ namespace RPG.Network
             return result;
         }
 
-        // === FIX (Lote 1): verifica espaço SEM modificar inventário ===
-        /// <summary>
-        /// Calcula quantos itens dessa quantidade CABERIAM no inventário atual,
-        /// sem modificar nada. Usado para validação prévia em operações de swap.
-        /// Retorna a quantidade que caberia (0..quantity).
-        /// </summary>
         [Server]
         public int CalculateHowManyFit(string itemId, int quantity)
         {
@@ -145,7 +135,6 @@ namespace RPG.Network
                 return Mathf.Min(quantity, Mathf.Max(0, freeSlots));
             }
 
-            // Stackable: conta espaço em stacks parciais + slots livres
             int maxStack = item.EffectiveMaxStack;
             int spaceInExisting = 0;
             foreach (var s in Slots)
@@ -153,16 +142,14 @@ namespace RPG.Network
                 if (s.ItemId == itemId && s.Quantity < maxStack)
                     spaceInExisting += (maxStack - s.Quantity);
             }
-            int freeSlotsAvail = Mathf.Max(0, MAX_INVENTORY_SLOTS - Slots.Count);
+            int freeSlotsAvail  = Mathf.Max(0, MAX_INVENTORY_SLOTS - Slots.Count);
             int spaceInNewSlots = freeSlotsAvail * maxStack;
             return Mathf.Min(quantity, spaceInExisting + spaceInNewSlots);
         }
 
         [Server]
         public bool HasRoomForItem(string itemId, int quantity = 1)
-        {
-            return CalculateHowManyFit(itemId, quantity) >= quantity;
-        }
+            => CalculateHowManyFit(itemId, quantity) >= quantity;
 
         [Server]
         private void NotifyQuestCollectItem(string itemId)
@@ -366,6 +353,9 @@ namespace RPG.Network
                 Slots.Add(slot);
             }
 
+            // FIX: garante que _nextSlotIndex fica ACIMA do maior SlotIndex carregado.
+            // Antes havia risco de colisão se slots eram carregados com índices altos
+            // enquanto _nextSlotIndex era resetado para 0.
             if (Slots.Count > 0)
                 _nextSlotIndex = Slots.Max(s => s.SlotIndex) + 1;
         }
@@ -434,8 +424,6 @@ namespace RPG.Network
             var db = Managers.DatabaseManager.Instance;
             if (db == null) return;
 
-            // === FIX (Lote 1): tenta drenar o purgatório ===
-            // Antes de salvar, se há itens pendentes de retorno, tenta entregar.
             TryFlushPendingReturns();
 
             db.SaveInventory(characterId, username, new List<InventorySlotData>(Slots));
@@ -447,11 +435,6 @@ namespace RPG.Network
             db.SaveEquipped(characterId, new List<EquippedItemData>(EquippedItems));
         }
 
-        /// <summary>
-        /// Tenta drenar a lista de itens pendentes (purgatório) de volta ao
-        /// inventário do jogador. Cada item pendente é retornado quando há
-        /// espaço; o que não couber permanece em fila.
-        /// </summary>
         [Server]
         private void TryFlushPendingReturns()
         {
@@ -468,24 +451,13 @@ namespace RPG.Network
                     string name = item?.DisplayName ?? itemId;
                     _netPlayer?.RpcShowMessageToOwner($"Item devolvido: {name} ×{qty}");
                 }
-                // Se não coube, mantém na fila para próxima oportunidade.
             }
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // SWAP HELPER — rollback que NUNCA duplica nem perde
+        // SWAP HELPER
         // ══════════════════════════════════════════════════════════════════
 
-        // === FIX (Lote 1): TrySwapFromInventory robusto ===
-        // Etapas:
-        //   1. Valida o slot original existe.
-        //   2. Se há oldItem para devolver, verifica ANTES se vai caber depois
-        //      de remover o slot. Aborta cedo se não couber, sem dano.
-        //   3. Remove o slot original.
-        //   4. Se há oldItem, tenta devolver. Se falhar (extremamente raro
-        //      após validação prévia, mas defesa contra race), salva em
-        //      purgatório (lista de pending returns) e informa o jogador.
-        //      O item NÃO é perdido — fica no servidor até haver espaço.
         [Server]
         private bool TrySwapFromInventory(int inventorySlotIndex, string newItemId,
                                           string oldItemId, out string failReason)
@@ -498,41 +470,26 @@ namespace RPG.Network
                 return false;
             }
 
-            // ── Validação prévia: se há oldItem, verifica espaço ANTES ─────
-            // Esta é a defesa principal contra perda. Ao remover o slot
-            // original, abrimos espaço para 1 stack. Se mesmo assim o oldItem
-            // não cabe (caso impossível para itens não-stackable, mas possível
-            // para stackables com configuração esquisita), abortamos.
             if (!string.IsNullOrEmpty(oldItemId))
             {
-                // Calcula espaço HIPOTÉTICO após remover o slot original:
-                // ainda temos (MAX_INVENTORY_SLOTS - Slots.Count + 1) slots livres
-                // (o slot original também conta como livre após remoção).
                 int hypotheticalFreeSlots = MAX_INVENTORY_SLOTS - Slots.Count + 1;
 
                 var oldItem = ItemDatabase.Instance?.GetItem(oldItemId);
                 if (oldItem == null)
                 {
-                    // oldItem não está no banco — não tentamos devolver, apenas
-                    // logamos. O slot ainda será removido (item novo será equipado).
                     Debug.LogError($"[NetworkInventory] oldItemId '{oldItemId}' não encontrado no banco. " +
                                    "Equip prossegue mas item antigo não será devolvido.");
                 }
                 else
                 {
-                    // Item não-stackable: 1 slot livre é suficiente (sempre é,
-                    // pois acabamos de liberar o slot original).
                     if (!oldItem.IsStackable && hypotheticalFreeSlots < 1)
                     {
                         failReason = "Sem espaço no inventário para o item antigo.";
                         return false;
                     }
-                    // Stackable: como vamos adicionar quantidade 1, e libera 1 slot,
-                    // sempre cabe. Não há cenário onde isso falhe para stackables.
                 }
             }
 
-            // ── Remove slot original ───────────────────────────────────────
             if (!ServerRemoveSlot(inventorySlotIndex))
             {
                 failReason = "Item desapareceu do inventário.";
@@ -541,30 +498,19 @@ namespace RPG.Network
                 return false;
             }
 
-            // ── Devolve oldItem se aplicável ───────────────────────────────
             if (!string.IsNullOrEmpty(oldItemId))
             {
                 int returnedSlot = ServerAddItem(oldItemId, 1);
                 if (returnedSlot < 0)
                 {
-                    // Caminho catastrófico — em teoria impossível após a
-                    // validação prévia, mas tratamos defensivamente.
-                    // Em vez de tentar rollback (que pode falhar e perder ambos),
-                    // colocamos o oldItem em PURGATÓRIO.
                     Debug.LogError($"[NetworkInventory] CAMINHO CATASTRÓFICO: " +
                                    $"oldItem '{oldItemId}' não pôde ser devolvido após validação. " +
                                    $"Adicionando ao purgatório. " +
                                    $"Player: {_netPlayer?.CharacterName ?? "?"}");
 
                     _pendingReturns.Add((oldItemId, 1));
-
                     _netPlayer?.RpcShowMessageToOwner(
                         "Aviso: item antigo será devolvido assim que houver espaço.");
-
-                    // O novo item AINDA será equipado (caller faz isso depois
-                    // do return true). O jogador não perde nada — o oldItem
-                    // fica no purgatório do servidor e é devolvido no próximo
-                    // save ou pickup que liberar espaço.
                 }
             }
 

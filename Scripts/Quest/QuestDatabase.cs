@@ -3,7 +3,9 @@ using UnityEngine;
 
 namespace RPG.Quest
 {
-stIds via este lookup; apenas IDs trafegam na rede.
+    /// <summary>
+    /// Banco de dados de quests. Resolve QuestIds via lookup;
+    /// apenas IDs trafegam na rede.
     /// </summary>
     public class QuestDatabase : MonoBehaviour
     {

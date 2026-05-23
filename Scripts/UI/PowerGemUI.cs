@@ -8,7 +8,7 @@ using System.Collections;
 
 namespace RPG.UI
 {
-    
+
     public class PowerGemUI : MonoBehaviour
     {
         public static PowerGemUI Instance { get; private set; }
@@ -36,6 +36,7 @@ namespace RPG.UI
         // ── Estado ─────────────────────────────────────────────────────────
         private NetworkInventory  _inventory;
         private bool              _isOpen    = false;
+        private bool              _destroyed = false; // FIX: flag para coroutine detectar OnDestroy
 
         private bool              _equipMode = false;
         private InventorySlotData _pendingGemSlot;
@@ -43,7 +44,6 @@ namespace RPG.UI
 
         private Coroutine _waitAndBindCoroutine;
 
-        // Subscrição ativa apenas em equip mode
         private bool _subscribedToInventoryChanged;
 
         private static readonly string[] SlotNames  = { "Q", "W", "E", "R" };
@@ -85,9 +85,12 @@ namespace RPG.UI
 
         private void OnDestroy()
         {
+            // FIX: marca como destruído para que a coroutine WaitAndBind não tente
+            // acessar componentes após a destruição do GameObject.
+            _destroyed = true;
+
             StopWaitAndBindCoroutine();
 
-            // Limpa TODAS as subscrições (loadout + inventory changed, se ativo)
             if (_inventory != null)
             {
                 _inventory.OnGemLoadoutChanged -= OnLoadoutChanged;
@@ -126,7 +129,6 @@ namespace RPG.UI
         {
             if (inventory == null || _inventory == inventory) return;
 
-            // Desinscreve do antigo
             if (_inventory != null)
             {
                 _inventory.OnGemLoadoutChanged -= OnLoadoutChanged;
@@ -140,7 +142,6 @@ namespace RPG.UI
             _inventory = inventory;
             _inventory.OnGemLoadoutChanged += OnLoadoutChanged;
 
-            // Se estávamos em equip mode, re-subscreve no novo
             if (_equipMode)
             {
                 _inventory.OnInventoryChanged += OnInventoryChangedEquipMode;
@@ -164,19 +165,29 @@ namespace RPG.UI
             return true;
         }
 
+        /// <summary>
+        /// FIX: coroutine verifica _destroyed a cada iteração para não acessar
+        /// componentes depois que o MonoBehaviour foi destruído. Antes podia
+        /// causar NullReferenceException se a janela fosse fechada/destruída
+        /// enquanto a coroutine ainda aguardava.
+        /// </summary>
         private IEnumerator WaitAndBind()
         {
             float elapsed = 0f;
             var wait = new WaitForSeconds(0.2f);
 
-            while (_inventory == null && elapsed < bindRetryTimeout)
+            while (!_destroyed && _inventory == null && elapsed < bindRetryTimeout)
             {
                 yield return wait;
                 elapsed += 0.2f;
+                if (_destroyed) break;
                 if (TryBindInventory()) break;
             }
 
             _waitAndBindCoroutine = null;
+
+            // FIX: verifica _destroyed antes de qualquer acesso a campos ou componentes
+            if (_destroyed) yield break;
 
             if (_inventory == null)
             {
@@ -196,12 +207,6 @@ namespace RPG.UI
             if (_isOpen) RefreshSlots();
         }
 
-        /// <summary>
-        /// Em equip mode, monitoramos o inventário. Se o item de origem sumir
-        /// (descartado, equipado em outro slot, dropado por morte), fechamos
-        /// a janela automaticamente — caso contrário, o jogador poderia clicar
-        /// num slot Q/W/E/R e o CmdEquipGem chegaria com slotIndex inválido.
-        /// </summary>
         private void OnInventoryChangedEquipMode()
         {
             if (!_equipMode || !_isOpen || _inventory == null) return;
@@ -238,7 +243,6 @@ namespace RPG.UI
             _pendingGemSlot       = default;
             _selectedGemSlotIndex = -1;
 
-            // Sai do equip mode: desinscreve do InventoryChanged
             if (_subscribedToInventoryChanged && _inventory != null)
             {
                 _inventory.OnInventoryChanged -= OnInventoryChangedEquipMode;
@@ -270,7 +274,6 @@ namespace RPG.UI
 
         public void OpenForEquip(InventorySlotData gemSlotData)
         {
-            // Valida que existe e é PowerGem ANTES de abrir
             if (_inventory != null)
             {
                 bool found = false;
@@ -290,7 +293,6 @@ namespace RPG.UI
             _pendingGemSlot       = gemSlotData;
             _selectedGemSlotIndex = -1;
 
-            // Subscreve em InventoryChanged para detectar se o item sumiu
             if (_inventory != null && !_subscribedToInventoryChanged)
             {
                 _inventory.OnInventoryChanged += OnInventoryChangedEquipMode;
@@ -327,7 +329,6 @@ namespace RPG.UI
             _equipMode            = false;
             _selectedGemSlotIndex = -1;
 
-            // Sai do equip mode: desinscreve do InventoryChanged
             if (_subscribedToInventoryChanged && _inventory != null)
             {
                 _inventory.OnInventoryChanged -= OnInventoryChangedEquipMode;
@@ -401,8 +402,6 @@ namespace RPG.UI
 
             if (_equipMode)
             {
-                // RE-VALIDAÇÃO ANTES DE ENVIAR Cmd
-                // Entre OpenForEquip e este clique, o item pode ter sumido.
                 bool stillValid = false;
                 foreach (var s in _inventory.Slots)
                 {

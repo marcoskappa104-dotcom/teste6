@@ -51,25 +51,18 @@ namespace RPG.Data
         public int AllocatedSTR, AllocatedAGI, AllocatedVIT;
         public int AllocatedDEX, AllocatedINT, AllocatedLUK;
 
-        // ── Cache de DerivedStats (opt-in via useCache=true) ───────────────
+        // ── Cache de DerivedStats ──────────────────────────────────────────
         [NonSerialized] private DerivedStats _cachedStats;
         [NonSerialized] private bool         _statsCacheDirty = true;
 
-        /// <summary>
-        /// Marca o cache como sujo. Chame após qualquer mutação que afete stats.
-        /// </summary>
         public void InvalidateStatsCache() => _statsCacheDirty = true;
 
         /// <summary>
-        /// Retorna stats derivados. Se useCache=true e nada mudou desde o último
-        /// cálculo, retorna a versão cacheada (zero alocação).
-        ///
-        /// IMPORTANTE: O cache não considera 'buff' como parte do estado;
-        /// se você passar um buff, o cache é IGNORADO.
+        /// Retorna stats derivados. Cache só é usado quando useCache=true e
+        /// não há buff envolvido.
         /// </summary>
         public DerivedStats GetDerivedStats(BuffBonuses buff = null, bool useCache = false)
         {
-            // Cache só vale quando não há buff envolvido
             if (useCache && buff == null && !_statsCacheDirty && _cachedStats != null)
                 return _cachedStats;
 
@@ -132,14 +125,18 @@ namespace RPG.Data
             return leveled;
         }
 
+        /// <summary>
+        /// Cria uma cópia profunda deste CharacterData.
+        /// FIX: usa o setter de Level (não o campo privado _level) para garantir
+        /// que o cache sujo seja marcado corretamente no clone.
+        /// </summary>
         public CharacterData Clone()
         {
-            return new CharacterData
+            var clone = new CharacterData
             {
                 CharacterId           = CharacterId,
                 CharacterName         = CharacterName,
                 Race                  = Race,
-                _level                = _level, // bypass setter to preserve cache state
                 Experience            = Experience,
                 ExperienceToNextLevel = ExperienceToNextLevel,
                 PosX = PosX, PosY = PosY, PosZ = PosZ,
@@ -150,7 +147,6 @@ namespace RPG.Data
                 AllocatedSTR = AllocatedSTR, AllocatedAGI = AllocatedAGI,
                 AllocatedVIT = AllocatedVIT, AllocatedDEX = AllocatedDEX,
                 AllocatedINT = AllocatedINT, AllocatedLUK = AllocatedLUK,
-                _statsCacheDirty      = true, // Clone começa com cache sujo
                 BaseAttributes = new BaseAttributes
                 {
                     STR = BaseAttributes.STR, AGI = BaseAttributes.AGI,
@@ -177,6 +173,15 @@ namespace RPG.Data
                     ResistLightning = EquipmentBonuses.ResistLightning
                 }
             };
+
+            // FIX: usa o setter para passar pelo clamp e marcar cache como sujo.
+            // Não acessa _level diretamente porque o campo é privado — o setter é o caminho correto.
+            clone.Level = _level;
+
+            // Clone sempre começa com cache sujo (EquipmentBonuses pode diferir).
+            clone._statsCacheDirty = true;
+
+            return clone;
         }
     }
 

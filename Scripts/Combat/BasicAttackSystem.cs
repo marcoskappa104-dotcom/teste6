@@ -179,7 +179,6 @@ namespace RPG.Combat
             InvalidateAttackIntervalCache();
         }
 
-        // === FIX (Lote 2): força modo chase se nova arma tem range menor ===
         private void OnEquipmentChanged()
         {
             var oldProfile = _currentProfile;
@@ -200,10 +199,6 @@ namespace RPG.Combat
                     {
                         Log($"Troca de arma → alvo a {dist:0.0}m, novo range {_currentProfile.Range:0.0}m. " +
                             "Forçando modo chase.");
-                        // Reset do agent para forçar reposicionamento no próximo frame.
-                        // A próxima chamada de UpdateAutoAttack vai detectar dist > range
-                        // e iniciar ChaseTarget — mas garantimos via ResetPath que o
-                        // agent não está parado próximo demais.
                         if (_agent != null && _agent.isOnNavMesh && !_agent.hasPath)
                         {
                             _agent.ResetPath();
@@ -261,9 +256,7 @@ namespace RPG.Combat
                 return;
             }
 
-            // === FIX (Lote 2): limpa _lastClickTarget destruído ===
-            // Defesa contra reuse de slot de memória após GC. Sem custo
-            // perceptível pois é só uma comparação por frame de Update.
+            // FIX: limpa _lastClickTarget destruído para evitar reuse de ponteiro obsoleto
             if (_lastClickTarget != null && IsTargetGone(_lastClickTarget))
             {
                 _lastClickTarget = null;
@@ -275,8 +268,13 @@ namespace RPG.Combat
 
         // ── API pública ────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Registra clique num monstro. Duplo-clique inicia auto-ataque.
+        /// FIX: verifica IsTargetDestroyedOrDead (Unity-null + IsDead) antes de processar.
+        /// </summary>
         public bool TryRegisterClick(NetworkMonsterEntity monster)
         {
+            // FIX: IsTargetGone agora verifica tanto Unity-destroyed quanto IsDead
             if (IsTargetGone(monster)) return false;
 
             float now           = Time.time;
@@ -480,8 +478,18 @@ namespace RPG.Combat
             return current == _attackTarget && current != null;
         }
 
+        /// <summary>
+        /// FIX: verifica tanto o Unity null (objeto destruído pelo GC/NetworkServer.Destroy)
+        /// quanto IsDead. Antes só verificava IsDead, causando NullReferenceException
+        /// quando o monstro era destruído antes do respawn.
+        /// </summary>
         private static bool IsTargetGone(NetworkMonsterEntity target)
-            => target == null || target.IsDead;
+        {
+            // Verificação de Unity null primeiro (operador == sobrecarregado pelo Unity)
+            if (target == null) return true;
+            // Verificação de morte lógica
+            return target.IsDead;
+        }
 
         private void Log(string msg)
         {

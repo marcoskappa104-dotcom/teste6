@@ -44,9 +44,6 @@ namespace RPG.Combat
         private const float IDLE_STOP_DIST          = 0.5f;
         private const float INSTANT_CAST_EPS        = 0.05f;
         private const float WALK_REDIRECT_THRESHOLD = 0.5f;
-
-        // Tolerância para considerar que o agent ainda está indo para o destino
-        // de walk-to-skill (vs. já ter sido redirecionado por click-to-move).
         private const float WALK_DEST_OWNERSHIP_TOLERANCE = 0.3f;
 
         // ── Componentes ────────────────────────────────────────────────────
@@ -172,15 +169,12 @@ namespace RPG.Combat
 
         private void OnPlayerTargetChanged(ITargetable newTarget)
         {
-            // Se estávamos caminhando para usar skill em um alvo específico
-            // e o alvo mudou (ou foi limpo), cancela o walk.
             if (_hasPendingWalk && _pendingTarget != null && newTarget != _pendingTarget)
             {
                 Log("Alvo mudou durante walk-to-skill — cancelando.");
                 CancelPendingWalkSoft();
             }
 
-            // Se estávamos castando em um alvo específico e o alvo mudou, cancela.
             if (_isCasting && _castTarget != null && newTarget != _castTarget)
             {
                 Log("Alvo mudou durante cast — cancelando.");
@@ -196,7 +190,7 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
-            // Belt-and-suspenders: se eventos não dispararam por algum motivo
+            // Belt-and-suspenders: garante limpeza mesmo se eventos não dispararam
             if ((_hasPendingWalk || _isCasting) && _player.IsDead)
             {
                 CancelPendingWalk();
@@ -420,17 +414,13 @@ namespace RPG.Combat
             bool  reachedRange   = false;
             bool  timedOut       = false;
 
-            // === FIX (Lote 2): captura o destino EFETIVO do agent ===
-            // Em vez de capturar _lastWalkDestination depois do loop, mantemos
-            // uma variável local atualizada apenas quando o SetDestination
-            // foi confirmado pelo agent (i.e., agent realmente está perseguindo).
-            // Isso evita divergência entre "o que pedimos" e "o que o agent fez".
             Vector3 agentAdoptedDest = Vector3.positiveInfinity;
 
             while (timeout > 0f)
             {
                 timeout -= Time.deltaTime;
 
+                // FIX: verificação de morte dentro do loop — cancela imediatamente
                 if (_player.IsDead)
                 {
                     Log("Walk: player morreu.");
@@ -465,12 +455,7 @@ namespace RPG.Combat
                     {
                         _agent.SetDestination(destination);
                         _lastWalkDestination = destination;
-
-                        // Captura o destino que o agent ADOTOU. Em geral é
-                        // igual ao destination que setamos, mas se o agent
-                        // rejeitou (path inválido), agent.destination pode
-                        // diferir.
-                        agentAdoptedDest = _agent.destination;
+                        agentAdoptedDest     = _agent.destination;
                     }
                 }
 
@@ -487,7 +472,6 @@ namespace RPG.Combat
             if (timeout <= 0f && !reachedRange)
                 timedOut = true;
 
-            // === FIX (Lote 2): usa o destino adotado pelo agent, não nosso pedido ===
             Vector3 ourLastDest = agentAdoptedDest;
 
             _walkCoroutine  = null;
@@ -500,6 +484,7 @@ namespace RPG.Combat
 
                 yield return null;
 
+                // FIX: verificação explícita de IsDead antes de executar skill
                 if (!_player.IsDead && IsTargetValid(target) && _player.CurrentTarget == target)
                 {
                     Log($"Em range. Executando skill {index}.");
@@ -513,9 +498,7 @@ namespace RPG.Combat
             else
             {
                 if (ShouldStopAgentAfterWalkExit(ourLastDest))
-                {
                     StopAgent();
-                }
 
                 if (timedOut)
                 {

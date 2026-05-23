@@ -3,7 +3,6 @@ using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 
-// Alias para resolver ambiguidade com UnityEngine.NetworkPlayer (legacy multiplayer)
 using NetworkPlayer = RPG.Network.NetworkPlayer;
 
 namespace RPG.UI
@@ -34,15 +33,36 @@ namespace RPG.UI
 
         public static void Show(NetworkPlayer player)
         {
-            if (_instance == null)
+            // FIX: se _instance for null (pode acontecer se o GameObject estava
+            // inativo no momento do Awake), tenta localizar na cena como fallback.
+            var ui = GetOrFindInstance();
+            if (ui == null)
             {
-                Debug.LogWarning("[DeathScreenUI] Não há instância na cena!");
+                Debug.LogWarning("[DeathScreenUI] Nenhuma instância encontrada na cena!");
                 return;
             }
-            _instance.ShowInternal(player);
+            ui.ShowInternal(player);
         }
 
-        public static void Hide() => _instance?.HideInternal();
+        public static void Hide()
+        {
+            var ui = GetOrFindInstance();
+            ui?.HideInternal();
+        }
+
+        /// <summary>
+        /// FIX: retorna a instância existente ou tenta encontrá-la na cena.
+        /// Resolve o bug onde o singleton ficava null se o GameObject estava
+        /// inativo quando Awake foi chamado (GameObjects inativos não executam Awake).
+        /// </summary>
+        private static DeathScreenUI GetOrFindInstance()
+        {
+            if (_instance != null) return _instance;
+
+            // Fallback: procura na cena (inclui inativos)
+            _instance = FindFirstObjectByType<DeathScreenUI>(FindObjectsInactive.Include);
+            return _instance;
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
@@ -56,6 +76,13 @@ namespace RPG.UI
 
             if (_respawnButton != null)
                 _respawnButton.onClick.AddListener(OnRespawnClicked);
+        }
+
+        private void OnEnable()
+        {
+            // FIX: garante que _instance aponta para esta instância quando
+            // o GameObject é reativado após ter sido inativo no Awake.
+            if (_instance == null) _instance = this;
         }
 
         private void OnDisable()
@@ -93,6 +120,10 @@ namespace RPG.UI
         private void ShowInternal(NetworkPlayer player)
         {
             _player = player;
+
+            // FIX: ativa o GameObject antes de tentar usar componentes,
+            // caso tenha sido desativado anteriormente.
+            gameObject.SetActive(true);
 
             if (_root != null) _root.SetActive(true);
             if (_titleText != null) _titleText.text = "Você morreu!";
