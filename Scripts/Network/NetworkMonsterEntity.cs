@@ -91,10 +91,6 @@ namespace RPG.Network
         private const float MOVING_UPDATE_INTERVAL         = 0.1f;
         private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f;
         private const int   AGGRO_OVERLAP_BUFFER_SIZE      = 32;
-
-        // === FIX (Lote 1): cap defensivo no damageLog ===
-        // 64 atacantes simultâneos cobre raids realistas. Bosses de MMO
-        // raramente passam disso por encontro.
         private const int   MAX_DAMAGE_LOG_ENTRIES         = 64;
 
         // ── SyncVars ───────────────────────────────────────────────────────
@@ -103,9 +99,6 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnDeadChanged))]      private bool  _isDead;
         [SyncVar(hook = nameof(OnIsMovingChanged))]  private bool  _isMoving;
 
-        // === FIX (Lote 1): geração de spawn ===
-        // Incrementa a cada respawn. Projéteis em voo podem comparar com a
-        // geração que armazenaram no disparo — se diferente, monstro respawnou.
         [SyncVar] private int _spawnGeneration = 0;
         public int SpawnGeneration => _spawnGeneration;
 
@@ -127,8 +120,6 @@ namespace RPG.Network
         // ── Estado interno ─────────────────────────────────────────────────
         private DerivedStats _stats;
         private readonly Dictionary<uint, float> _damageLog = new();
-
-        // Buffer reutilizável para cleanup de órfãos (zero alocação em estado estável)
         private readonly List<uint> _damageLogCleanupBuffer = new(8);
 
         private float _kiteDistance;
@@ -157,6 +148,9 @@ namespace RPG.Network
 
         private Collider[] _aggroOverlapBuffer;
 
+        // FIX: cache do collider principal para desativar na morte
+        private Collider _mainCollider;
+
         private float _lastIsMovingUpdateTime;
 
         private Coroutine _aggroScanCoroutine;
@@ -181,6 +175,11 @@ namespace RPG.Network
         {
             _agent    = GetComponent<NavMeshAgent>();
             _animator = GetComponentInChildren<Animator>();
+
+            // FIX: cacheia o collider principal para desativar/ativar na morte/respawn
+            _mainCollider = GetComponent<Collider>();
+            if (_mainCollider == null)
+                _mainCollider = GetComponentInChildren<Collider>();
 
             baseSTR = Mathf.Max(1, baseSTR);
             baseAGI = Mathf.Max(1, baseAGI);
@@ -219,6 +218,10 @@ namespace RPG.Network
             if (selectionIndicator) selectionIndicator.SetActive(false);
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
             if (visualRoot) visualRoot.SetActive(true);
+
+            // FIX: garante que o collider está ativo ao spawnar
+            if (_mainCollider != null) _mainCollider.enabled = true;
+
             RestoreVisualsAlpha();
         }
 
@@ -268,8 +271,6 @@ namespace RPG.Network
             _patrolTargetSet   = false;
             _damageLog.Clear();
 
-            // === FIX (Lote 1): incrementa geração ===
-            // Projéteis em voo verão SpawnGeneration mudada e abortarão impacto.
             _spawnGeneration++;
 
             _kiteDistance = attackRange * kiteDistanceFraction;
@@ -461,7 +462,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Estados de IA (sem mudanças)
+        // Estados de IA
         // ══════════════════════════════════════════════════════════════════
 
         private void ServerPatrolWaypoints()
@@ -775,10 +776,6 @@ namespace RPG.Network
             return null;
         }
 
-        // === FIX (Lote 1): cap defensivo no _damageLog ===
-        // Em raids massivos, limita o tracking aos 64 atacantes com mais dano.
-        // Atacantes adicionais ainda CAUSAM dano normalmente, só não recebem
-        // XP no kill. É um compromise: proteger memória vs distribuição perfeita.
         [Server]
         private void CreditDamageToShooter(uint shooterNetId, float dmg)
         {
@@ -794,23 +791,15 @@ namespace RPG.Network
                 return;
             }
 
-            // Atacante novo. Se atingimos o cap, evicta o de menor dano.
             if (_damageLog.Count >= MAX_DAMAGE_LOG_ENTRIES)
             {
                 EvictLowestDamageContributor(dmg, shooterNetId);
-                // Se a eviction falhou (improvável — só se nenhum tem menos dano
-                // que o novo), descarta silenciosamente este crédito.
                 if (_damageLog.Count >= MAX_DAMAGE_LOG_ENTRIES) return;
             }
 
             _damageLog[shooterNetId] = dmg;
         }
 
-        /// <summary>
-        /// Remove o atacante com MENOR dano cumulativo se o novo dano for
-        /// maior que ele. Caso contrário, mantém o estado e o novo crédito
-        /// é descartado. Garante que sempre rastreamos os top contributors.
-        /// </summary>
         [Server]
         private void EvictLowestDamageContributor(float newDamage, uint newShooterNetId)
         {
@@ -828,7 +817,6 @@ namespace RPG.Network
                 }
             }
 
-            // Só evicta se o novo dano supera o menor existente
             if (newDamage > lowestValue && lowestKey != 0)
                 _damageLog.Remove(lowestKey);
         }
@@ -907,7 +895,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // CmdBasicAttack (sem mudanças semânticas)
+        // CmdBasicAttack
         // ══════════════════════════════════════════════════════════════════
 
         [Command(requiresAuthority = false)]
@@ -1062,8 +1050,6 @@ namespace RPG.Network
             }
 
             NetworkServer.Spawn(go);
-            // === FIX (Lote 1): passa a geração atual do monstro ===
-            // Projétil armazena para detectar respawn entre disparo e impacto.
             proj.ServerInitialize(this, attacker.netId, profile.ProjectileSpeed, damage, crit, _spawnGeneration);
         }
 
@@ -1220,14 +1206,27 @@ namespace RPG.Network
         {
             if (this == null) yield break;
 
+            // FIX: envia RPC de morte para todos os clientes (desativa collider, inicia fade)
             RpcOnDied(transform.position);
+
+            // FIX: aguarda o fade do corpo no cliente antes de destruir/respawnar
+            // bodyFadeDelay + bodyFadeDuration = tempo total do fade no cliente
+            float clientFadeTotal = bodyFadeDelay + bodyFadeDuration + 0.5f; // 0.5s de margem
 
             if (respawnDelay <= 0f)
             {
+                // Sem respawn: aguarda o fade e destrói o objeto
+                yield return new WaitForSeconds(clientFadeTotal);
+
                 _deathSequenceCoroutine = null;
+
+                if (this != null && isServer)
+                    NetworkServer.Destroy(gameObject);
+
                 yield break;
             }
 
+            // Com respawn: aguarda o respawnDelay e reinicia
             yield return new WaitForSeconds(respawnDelay);
 
             if (this == null || !isServer)
@@ -1263,7 +1262,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // ClientRpcs (sem mudanças)
+        // ClientRpcs
         // ══════════════════════════════════════════════════════════════════
 
         [ClientRpc]
@@ -1299,12 +1298,18 @@ namespace RPG.Network
                 crit ? new Color(1f, 0.3f, 0f) : new Color(1f, 0.2f, 0.2f));
         }
 
+        // FIX: RpcOnDied agora desativa o collider imediatamente, impedindo que
+        // o monstro morto seja clicado ou detectado por raycast em outros clientes.
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
             if (Application.isBatchMode) return;
 
             OnDeselected();
+
+            // FIX: desativa o collider para que o monstro não seja mais clicável
+            if (_mainCollider != null) _mainCollider.enabled = false;
+
             if (healthBarUI != null) healthBarUI.gameObject.SetActive(false);
 
             var localPlayerGO = NetworkClient.localPlayer;
@@ -1387,6 +1392,8 @@ namespace RPG.Network
                 }
             }
 
+            // FIX: ao terminar o fade, desativa o visualRoot
+            // (o NetworkServer.Destroy cuidará de remover o objeto da rede)
             if (this != null && visualRoot != null)
                 visualRoot.SetActive(false);
 
@@ -1410,6 +1417,7 @@ namespace RPG.Network
                 if (r != null) r.SetPropertyBlock(null);
         }
 
+        // FIX: RpcOnRespawned reativa o collider ao respawnar
         [ClientRpc]
         private void RpcOnRespawned()
         {
@@ -1423,6 +1431,9 @@ namespace RPG.Network
 
             ReleaseFadeMaterials();
             RestoreVisualsAlpha();
+
+            // FIX: reativa o collider para que o monstro possa ser clicado novamente
+            if (_mainCollider != null) _mainCollider.enabled = true;
 
             if (visualRoot)         visualRoot.SetActive(true);
             if (selectionIndicator) selectionIndicator.SetActive(false);
