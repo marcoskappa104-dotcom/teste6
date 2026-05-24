@@ -98,10 +98,25 @@ namespace RPG
         // ══════════════════════════════════════════════════════════════════
         public static class World
         {
-            public const float WORLD_ITEM_DESPAWN_SECONDS = 60f;
-            public const float MONSTER_RESPAWN_SECONDS    = 15f;
-            public const float MONSTER_BODY_FADE_DELAY    = 5f;
-            public const float MONSTER_BODY_FADE_DURATION = 1f;
+            public const float ITEM_DROP_LIFETIME_SECONDS = 60f;
+            public const float MONSTER_CORPSE_LIFETIME    = 10f;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // Spawn Inicial por Região
+        // ══════════════════════════════════════════════════════════════════
+        public static class InitialSpawn
+        {
+            public static (float x, float y, float z) GetSpawn(RPG.Data.CharacterRace race) => race switch
+            {
+                RPG.Data.CharacterRace.Paulista   => (0f, 1f, 0f),
+                RPG.Data.CharacterRace.Mineiro    => (50f, 1f, 0f),
+                RPG.Data.CharacterRace.Maranhense => (0f, 1f, 50f),
+                RPG.Data.CharacterRace.Baiano     => (-50f, 1f, 0f),
+                RPG.Data.CharacterRace.Cearense   => (0f, 1f, -50f),
+                RPG.Data.CharacterRace.Sergipano  => (25f, 1f, 25f),
+                _                                 => (0f, 1f, 0f)
+            };
         }
     }
 }

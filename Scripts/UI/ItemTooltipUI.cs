@@ -305,7 +305,7 @@ namespace RPG.UI
                                                    out CharacterRace race)
         {
             level = 1; str = 0; agi = 0; vit = 0; dex = 0; intt = 0; luk = 0;
-            race  = CharacterRace.Human;
+            race  = CharacterRace.Paulista;
 
             var localId = NetworkClient.localPlayer;
             if (localId == null) return false;

@@ -14,13 +14,9 @@ namespace RPG.Managers
         [Tooltip("Precisa ter NetworkIdentity + WorldItem.")]
         [SerializeField] private GameObject worldItemPrefab;
 
-        [Header("Tabela de Drop Global (fallback)")]
-        [Tooltip("Itens que qualquer monstro pode dropar se não tiver tabela própria.")]
-        [SerializeField] private List<ItemData> globalDropTable = new List<ItemData>();
-
         [Header("Configuração")]
         [SerializeField] private float spawnHeightOffset = 0.3f;
-        [SerializeField] private float dropScatterRadius = 0.8f;
+        [SerializeField] private float dropScatterRadius = 1.5f;
 
         private const int MAX_DROPS_PER_SPAWN = 16;
 
@@ -44,10 +40,9 @@ namespace RPG.Managers
         /// </summary>
         [Server]
         public void ServerSpawnDrop(
-            Vector3        position,
-            float          dropChance      = 50f,
-            List<ItemData> customDropTable = null,
-            List<string>   guaranteedDrops = null)
+            Vector3         originPosition,
+            List<LootEntry> customDropTable = null,
+            List<string>    guaranteedDrops = null)
         {
             if (!NetworkServer.active) return;
 
@@ -57,31 +52,47 @@ namespace RPG.Managers
                 return;
             }
 
+            // Tenta encontrar o chão a partir da posição de origem
+            Vector3 landPosition = originPosition;
+            if (Physics.Raycast(originPosition + Vector3.up, Vector3.down, out RaycastHit hit, 5f))
+            {
+                // Só aceita o hit se ele não for absurdamente longe da origem (0,0,0) 
+                // caso o originPosition seja válido.
+                if (hit.point.sqrMagnitude > 0.001f || originPosition.sqrMagnitude < 0.001f)
+                {
+                    landPosition = hit.point;
+                }
+            }
+
             int dropIndex = 0;
 
-            // Drops garantidos (com cap defensivo)
+            // 1. Drops garantidos (com cap defensivo)
             if (guaranteedDrops != null)
             {
                 int limit = Mathf.Min(guaranteedDrops.Count, MAX_DROPS_PER_SPAWN);
                 for (int i = 0; i < limit; i++)
                 {
-                    Vector3 pos = ScatterPosition(position, dropIndex++);
-                    SpawnWorldItem(pos, guaranteedDrops[i]);
+                    Vector3 pos = ScatterPosition(landPosition, dropIndex++);
+                    SpawnWorldItem(pos, guaranteedDrops[i], originPosition);
                 }
             }
 
-            // Drop aleatório
-            if (Random.Range(0f, 100f) > dropChance) return;
-
-            var table = (customDropTable != null && customDropTable.Count > 0)
-                ? customDropTable
-                : globalDropTable;
-
-            string droppedId = ItemDatabase.RollDrop(table);
-            if (!string.IsNullOrEmpty(droppedId) && dropIndex < MAX_DROPS_PER_SPAWN)
+            // 2. Drops da tabela (cada item rola sua própria chance)
+            if (customDropTable != null)
             {
-                Vector3 pos = ScatterPosition(position, dropIndex);
-                SpawnWorldItem(pos, droppedId);
+                foreach (var entry in customDropTable)
+                {
+                    if (entry.Item == null) continue;
+                    if (dropIndex >= MAX_DROPS_PER_SPAWN) break;
+
+                    // Rola a chance individual do item configurada na tabela
+                    float roll = Random.Range(0f, 100f);
+                    if (roll <= entry.DropChance)
+                    {
+                        Vector3 pos = ScatterPosition(landPosition, dropIndex++);
+                        SpawnWorldItem(pos, entry.Item.ItemId, originPosition);
+                    }
+                }
             }
         }
 
@@ -89,7 +100,7 @@ namespace RPG.Managers
         /// Valida o item ANTES de instanciar para evitar memory leak.
         /// </summary>
         [Server]
-        private void SpawnWorldItem(Vector3 position, string itemId)
+        private void SpawnWorldItem(Vector3 targetPosition, string itemId, Vector3 origin)
         {
             if (string.IsNullOrEmpty(itemId)) return;
 
@@ -105,7 +116,7 @@ namespace RPG.Managers
                 return;
             }
 
-            var go   = Instantiate(worldItemPrefab, position, Quaternion.identity);
+            var go   = Instantiate(worldItemPrefab, targetPosition, Quaternion.identity);
             var item = go.GetComponent<RPG.Network.WorldItem>();
 
             if (item == null)
@@ -116,19 +127,22 @@ namespace RPG.Managers
                 return;
             }
 
-            item.ServerInitialize(itemId);
+            item.ServerInitialize(itemId, origin, targetPosition);
             NetworkServer.Spawn(go);
         }
 
         /// <summary>
-        /// Distribui drops em padrão de espiral (ângulo dourado).
+        /// Distribui drops em direções aleatórias ao redor do centro.
         /// </summary>
         private Vector3 ScatterPosition(Vector3 center, int index)
         {
-            if (index == 0) return center + Vector3.up * spawnHeightOffset;
-
-            float angle = index * 137.5f * Mathf.Deg2Rad; // ângulo dourado
-            float r     = dropScatterRadius * (0.5f + 0.5f * (index % 3) / 3f);
+            // Usa um ângulo baseado no index + aleatório para garantir dispersão mesmo se Random falhar
+            float baseAngle = Random.Range(0f, 360f);
+            float angle     = (baseAngle + (index * (360f / 4f))) * Mathf.Deg2Rad; 
+            
+            // Distância entre 1.0 e o raio máximo
+            float r = Random.Range(Mathf.Min(1.0f, dropScatterRadius), dropScatterRadius);
+            
             return new Vector3(
                 center.x + Mathf.Cos(angle) * r,
                 center.y + spawnHeightOffset,

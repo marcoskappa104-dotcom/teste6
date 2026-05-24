@@ -61,7 +61,7 @@ namespace RPG.UI
 
         [Header("Configuração")]
         [Tooltip("Tempo máximo de espera pela confirmação do servidor (fallback para alta latência).")]
-        [SerializeField] private float allocateConfirmTimeout = 1.5f;
+        [SerializeField] private float allocateConfirmTimeout = 3.0f;
 
         private PlayerEntity  _player;
         private NetworkPlayer _netPlayer;
@@ -175,6 +175,14 @@ namespace RPG.UI
             RefreshFreePointsBanner(newPoints);
             RefreshPlusButtons(newPoints);
             if (_isOpen) RefreshAll();
+        }
+
+        public void OnAllocationFailed(string reason)
+        {
+            StopAllocateTimeout();
+            FinishAllocating();
+            if (!string.IsNullOrEmpty(reason))
+                UIManager.Instance?.ShowMessage(reason);
         }
 
         // ── Abrir / Fechar ─────────────────────────────────────────────────
@@ -414,8 +422,8 @@ namespace RPG.UI
 
             if (!_allocating) yield break;
 
-            Debug.LogWarning("[AttributeWindowUI] Timeout aguardando confirmação de alocação. " +
-                             "Re-habilitando botões.");
+            Debug.LogWarning($"[AttributeWindowUI] Timeout de {allocateConfirmTimeout}s atingido. " +
+                             "A resposta do servidor demorou demais ou foi perdida.");
             FinishAllocating();
         }
 
@@ -444,11 +452,12 @@ namespace RPG.UI
 
         private static string RaceDisplayName(CharacterRace race) => race switch
         {
-            CharacterRace.Human  => "Humano",
-            CharacterRace.Elf    => "Elfo",
-            CharacterRace.Dwarf  => "Anão",
-            CharacterRace.Orc    => "Orc",
-            CharacterRace.Undead => "Morto-Vivo",
+            CharacterRace.Paulista   => "Paulista",
+            CharacterRace.Mineiro    => "Mineiro",
+            CharacterRace.Maranhense => "Maranhense",
+            CharacterRace.Baiano     => "Baiano",
+            CharacterRace.Cearense   => "Cearense",
+            CharacterRace.Sergipano  => "Sergipano",
             _ => race.ToString()
         };
     }

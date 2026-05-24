@@ -30,13 +30,14 @@ namespace RPG.Data
     [Flags]
     public enum CharacterRaceFlags : byte
     {
-        None   = 0,
-        Human  = 1 << 0,
-        Elf    = 1 << 1,
-        Dwarf  = 1 << 2,
-        Orc    = 1 << 3,
-        Undead = 1 << 4,
-        All    = Human | Elf | Dwarf | Orc | Undead
+        None       = 0,
+        Paulista   = 1 << 0,
+        Mineiro    = 1 << 1,
+        Maranhense = 1 << 2,
+        Baiano     = 1 << 3,
+        Cearense   = 1 << 4,
+        Sergipano  = 1 << 5,
+        All        = Paulista | Mineiro | Maranhense | Baiano | Cearense | Sergipano
     }
 
     /// <summary>
@@ -168,12 +169,13 @@ namespace RPG.Data
             {
                 _raceFlagCache[(int)r] = r switch
                 {
-                    CharacterRace.Human  => CharacterRaceFlags.Human,
-                    CharacterRace.Elf    => CharacterRaceFlags.Elf,
-                    CharacterRace.Dwarf  => CharacterRaceFlags.Dwarf,
-                    CharacterRace.Orc    => CharacterRaceFlags.Orc,
-                    CharacterRace.Undead => CharacterRaceFlags.Undead,
-                    _                    => CharacterRaceFlags.None
+                    CharacterRace.Paulista   => CharacterRaceFlags.Paulista,
+                    CharacterRace.Mineiro    => CharacterRaceFlags.Mineiro,
+                    CharacterRace.Maranhense => CharacterRaceFlags.Maranhense,
+                    CharacterRace.Baiano     => CharacterRaceFlags.Baiano,
+                    CharacterRace.Cearense   => CharacterRaceFlags.Cearense,
+                    CharacterRace.Sergipano  => CharacterRaceFlags.Sergipano,
+                    _                        => CharacterRaceFlags.None
                 };
             }
         }
@@ -219,12 +221,13 @@ namespace RPG.Data
             if (flags == CharacterRaceFlags.None) return "Nenhuma raça";
             if (flags == CharacterRaceFlags.All)  return "Todas as raças";
 
-            var names = new List<string>(5);
-            if ((flags & CharacterRaceFlags.Human)  != 0) names.Add("Humanos");
-            if ((flags & CharacterRaceFlags.Elf)    != 0) names.Add("Elfos");
-            if ((flags & CharacterRaceFlags.Dwarf)  != 0) names.Add("Anões");
-            if ((flags & CharacterRaceFlags.Orc)    != 0) names.Add("Orcs");
-            if ((flags & CharacterRaceFlags.Undead) != 0) names.Add("Mortos-Vivos");
+            var names = new List<string>(6);
+            if ((flags & CharacterRaceFlags.Paulista)   != 0) names.Add("Paulistas");
+            if ((flags & CharacterRaceFlags.Mineiro)    != 0) names.Add("Mineiros");
+            if ((flags & CharacterRaceFlags.Maranhense) != 0) names.Add("Maranhenses");
+            if ((flags & CharacterRaceFlags.Baiano)     != 0) names.Add("Baianos");
+            if ((flags & CharacterRaceFlags.Cearense)   != 0) names.Add("Cearenses");
+            if ((flags & CharacterRaceFlags.Sergipano)  != 0) names.Add("Sergipanos");
             return $"Apenas {string.Join(", ", names)}";
         }
 

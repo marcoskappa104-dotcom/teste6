@@ -24,11 +24,18 @@ namespace RPG.Network
         [SerializeField] private float bobFrequency = 1.5f;
         [SerializeField] private float pickupRadius = 2.5f;
 
+        [Header("Efeito de Salto")]
+        [SerializeField] private bool  useJumpEffect = true;
+        [SerializeField] private float jumpHeight    = 1.5f;
+        [SerializeField] private float jumpDuration  = 0.6f;
+
         // Multiplicador anti-cheat: aceita pickups com folga para latência,
         // mas não tão generoso a ponto de viabilizar trapaça óbvia.
         private const float PICKUP_LATENCY_TOLERANCE = 1.5f;
 
-        [SyncVar(hook = nameof(OnItemIdChanged))] private string _itemId = "";
+        [SyncVar(hook = nameof(OnItemIdChanged))]   private string  _itemId = "";
+        [SyncVar]                                   private Vector3 _spawnOrigin;
+        [SyncVar(hook = nameof(OnTargetPosChanged))] private Vector3 _targetPos;
 
         public string ItemId => _itemId;
 
@@ -36,15 +43,19 @@ namespace RPG.Network
         private float     _startLocalY;
         private bool      _hasVisualRoot;
         private Coroutine _despawnCoroutine;
+        private float     _jumpTime;
+        private bool      _isJumping;
 
         // ══════════════════════════════════════════════════════════════════
         // Server
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
-        public void ServerInitialize(string itemId)
+        public void ServerInitialize(string itemId, Vector3 origin, Vector3 target)
         {
-            _itemId = itemId;
+            _itemId      = itemId;
+            _spawnOrigin = origin;
+            _targetPos   = target;
             _despawnCoroutine = StartCoroutine(AutoDespawn());
         }
 
@@ -77,6 +88,78 @@ namespace RPG.Network
                 _startLocalY = visualRoot.localPosition.y;
 
             RefreshVisual(_itemId);
+
+            if (useJumpEffect && _hasVisualRoot)
+            {
+                // Inicia o salto. Não esperamos SyncVars aqui, pois elas vêm no pacote de spawn.
+                // Mas garantimos que o visual começa escondido ou no lugar certo.
+                StartCoroutine(JumpRoutine());
+            }
+        }
+
+        private void OnTargetPosChanged(Vector3 oldPos, Vector3 newPos)
+        {
+            // Mirror sincroniza o transform.position, mas forçamos aqui para garantir
+            if (newPos.sqrMagnitude > 0.001f)
+                transform.position = newPos;
+        }
+
+        private IEnumerator JumpRoutine()
+        {
+            if (!_hasVisualRoot) yield break;
+
+            _isJumping = true;
+            
+            // Aguarda um tempo mínimo para garantir que os dados de spawn chegaram
+            // e o transform.position foi atualizado pelo Mirror.
+            float waitTime = 0.1f;
+            while (waitTime > 0)
+            {
+                if (_targetPos.sqrMagnitude > 0.001f) break;
+                waitTime -= Time.deltaTime;
+                yield return null;
+            }
+
+            // Posição final (onde o objeto principal deve ficar parado)
+            Vector3 destination = _targetPos.sqrMagnitude > 0.001f ? _targetPos : transform.position;
+            // Posição inicial (de onde o item salta - o monstro)
+            Vector3 startPos = _spawnOrigin.sqrMagnitude > 0.001f ? _spawnOrigin : destination;
+
+            // Fixamos o objeto principal no destino
+            transform.position = destination;
+            
+            // O visual começa no monstro (em coordenadas de mundo)
+            visualRoot.position = startPos;
+            visualRoot.gameObject.SetActive(true);
+
+            float elapsed = 0f;
+            float randomHeight   = jumpHeight * Random.Range(1.1f, 1.4f);
+            float randomDuration = jumpDuration * Random.Range(0.85f, 1.15f);
+            Vector3 rotSpeed     = new Vector3(Random.Range(-350f, 350f), Random.Range(-350f, 350f), Random.Range(-350f, 350f));
+
+            while (elapsed < randomDuration)
+            {
+                elapsed += Time.deltaTime;
+                float t = elapsed / randomDuration;
+
+                // Curva de parábola
+                float h = Mathf.Sin(t * Mathf.PI) * randomHeight;
+                
+                // Interpolação linear do mundo entre monstro e destino
+                Vector3 currentPos = Vector3.Lerp(startPos, destination, t);
+                currentPos.y += h;
+
+                // Move o visualRoot (filho) enquanto o transform (pai) está fixo no destino
+                visualRoot.position = currentPos;
+                visualRoot.Rotate(rotSpeed * Time.deltaTime);
+
+                yield return null;
+            }
+
+            // Finaliza: reseta localmente para o efeito de bobbing (flutuar) começar
+            visualRoot.localPosition = new Vector3(0, _startLocalY, 0);
+            visualRoot.localRotation = Quaternion.identity;
+            _isJumping = false;
         }
 
         private void OnItemIdChanged(string oldId, string newId) => RefreshVisual(newId);
@@ -103,6 +186,18 @@ namespace RPG.Network
         private void Update()
         {
             if (!isClient || !_hasVisualRoot) return;
+
+            // PROTEÇÃO: Se o item "fugir" para o zero após o pulo ou por erro de rede, trazemos ele de volta
+            if (!_isJumping && _targetPos.sqrMagnitude > 0.001f)
+            {
+                // Se a distância for muito grande (indicando teleporte pro zero), força a posição
+                if (Vector3.Distance(transform.position, _targetPos) > 0.01f)
+                {
+                    transform.position = _targetPos;
+                }
+            }
+
+            if (_isJumping) return;
 
             float newLocalY = _startLocalY
                 + Mathf.Sin(Time.time * bobFrequency * Mathf.PI * 2f) * bobAmplitude;

@@ -540,6 +540,8 @@ namespace RPG.Managers
                     ch.CurrentHP = stats.MaxHP;
                     ch.CurrentMP = stats.MaxMP;
 
+                    var spawn = GameConstants.InitialSpawn.GetSpawn(ch.Race);
+
                     _db.Insert(new CharacterRow
                     {
                         CharacterId   = ch.CharacterId,
@@ -551,7 +553,7 @@ namespace RPG.Managers
                         ExpToNext     = ch.ExperienceToNextLevel,
                         CurrentHP     = ch.CurrentHP,
                         CurrentMP     = ch.CurrentMP,
-                        PosX = 0f, PosY = 1f, PosZ = 0f,
+                        PosX = spawn.x, PosY = spawn.y, PosZ = spawn.z,
                         CurrentMap    = ch.CurrentMap,
                         FreePoints    = 0,
                         AllocSTR = 0, AllocAGI = 0, AllocVIT = 0,

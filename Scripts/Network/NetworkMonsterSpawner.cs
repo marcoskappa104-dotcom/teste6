@@ -170,11 +170,53 @@ namespace RPG.Network
         {
             var mob = Instantiate(group.monsterPrefab, position, Quaternion.identity);
 
-            // Configura SetSpawnData ANTES do Spawn para que OnStartServer já tenha o home
+            // Configura SetupMonster ANTES do Spawn para que OnStartServer já tenha o home
             var entity = mob.GetComponent<NetworkMonsterEntity>();
-            entity?.SetSpawnData(position, group.patrolRadius);
+            if (entity != null)
+            {
+                entity.SetupMonster(this, position, group.patrolRadius, group.monsterPrefab);
+            }
 
             NetworkServer.Spawn(mob);
+        }
+
+        [Server]
+        public void ServerNotifyDeath(GameObject prefab, Vector3 position, float patrolRadius, float delay)
+        {
+            if (delay <= 0) return;
+            StartCoroutine(ServerDelayedRespawn(prefab, position, patrolRadius, delay));
+        }
+
+        private IEnumerator ServerDelayedRespawn(GameObject prefab, Vector3 position, float patrolRadius, float delay)
+        {
+            yield return new WaitForSeconds(delay);
+            
+            // Procura o grupo original para garantir que as configs do prefab estão certas
+            SpawnGroup foundGroup = null;
+            foreach (var group in spawnGroups)
+            {
+                if (group.monsterPrefab == prefab)
+                {
+                    foundGroup = group;
+                    break;
+                }
+            }
+
+            if (foundGroup != null)
+            {
+                SpawnMonster(foundGroup, position);
+            }
+            else
+            {
+                // Fallback se não achar o grupo (improvável se o prefab for o mesmo)
+                var mob = Instantiate(prefab, position, Quaternion.identity);
+                var entity = mob.GetComponent<NetworkMonsterEntity>();
+                if (entity != null)
+                {
+                    entity.SetupMonster(this, position, patrolRadius, prefab);
+                }
+                NetworkServer.Spawn(mob);
+            }
         }
 
         private Vector3? FindSpawnPositionInZone(Vector3 center, float radius, List<Vector3> usedPositions)

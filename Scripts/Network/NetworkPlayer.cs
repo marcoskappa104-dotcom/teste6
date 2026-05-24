@@ -49,7 +49,7 @@ namespace RPG.Network
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnNetNameChanged))]       public string CharacterName         = "...";
-        [SyncVar(hook = nameof(OnRaceStrChanged))]       public string RaceStr               = "Human";
+        [SyncVar(hook = nameof(OnRaceStrChanged))]       public string RaceStr               = "Paulista";
         [SyncVar(hook = nameof(OnNetLevelChanged))]      public int    Level                 = 1;
 
         [SyncVar(hook = nameof(OnNetMaxHPChanged))]      public float  MaxHP                 = 1f;
@@ -123,7 +123,7 @@ namespace RPG.Network
 
         private Coroutine _regenCoroutine;
 
-        private CharacterRace _cachedRace = CharacterRace.Human;
+        private CharacterRace _cachedRace = CharacterRace.Paulista;
 
         private bool          _clientInitialized;
         private bool          _pendingClientInit;
@@ -473,6 +473,10 @@ namespace RPG.Network
                 if (this == null || !isServer) yield break;
                 if (Dead) continue;
 
+                // Otimização: se HP e MP estão cheios, não processa nada
+                if (CurrentHP >= MaxHP - 0.01f && CurrentMP >= MaxMP - 0.01f)
+                    continue;
+
                 var stats = _serverStats;
                 if (stats == null) continue;
 
@@ -511,6 +515,11 @@ namespace RPG.Network
         public void CmdSetMoving(bool moving)
         {
             if (connectionToClient == null) return;
+
+            // Validação básica: se o player diz que está parado mas o agent ainda tem velocidade alta, 
+            // ou se diz que está movendo mas está morto.
+            if (Dead && moving) return;
+
             IsMoving = moving;
         }
 
@@ -519,15 +528,30 @@ namespace RPG.Network
         {
             if (connectionToClient == null) return;
 
-            if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL) return;
-            if (FreeAttributePoints <= 0 || _serverCharData == null) return;
-            if (attributeIndex < 0 || attributeIndex > 5) return;
+            if (Time.time - _lastAllocateTime < ALLOCATE_MIN_INTERVAL)
+            {
+                RpcAllocateRejected("Aguarde um pouco antes de alocar novamente.");
+                return;
+            }
+
+            if (FreeAttributePoints <= 0 || _serverCharData == null)
+            {
+                RpcAllocateRejected("Você não tem pontos suficientes.");
+                return;
+            }
+
+            if (attributeIndex < 0 || attributeIndex > 5)
+            {
+                RpcAllocateRejected("Atributo inválido.");
+                return;
+            }
 
             _lastAllocateTime = Time.time;
 
             if (IsAllocationLimitExceeded(attributeIndex))
             {
                 Debug.LogWarning($"[Security] {CharacterName} tentou alocar atributo {attributeIndex} além do limite.");
+                RpcAllocateRejected("Limite de pontos para este atributo atingido.");
                 return;
             }
 
@@ -620,6 +644,10 @@ namespace RPG.Network
                 if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
                 if (healed > 0f) RpcShowHeal(healed);
             }
+
+            // SINCRONIZA ANIMAÇÃO PARA TODOS
+            if (!string.IsNullOrEmpty(skill.AnimTrigger))
+                RpcPlayAnimation(skill.AnimTrigger);
 
             RpcSkillConfirmed(skillIndex, skill.Cooldown);
         }
@@ -792,7 +820,7 @@ namespace RPG.Network
             if (System.Enum.TryParse<CharacterRace>(RaceStr, out var race))
                 _cachedRace = race;
             else
-                _cachedRace = CharacterRace.Human;
+                _cachedRace = CharacterRace.Paulista;
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -946,6 +974,13 @@ namespace RPG.Network
         {
             if (!isLocalPlayer) return;
             GetComponent<SkillSystem>()?.OnServerSkillConfirmed(skillIndex, cooldown);
+        }
+
+        [ClientRpc]
+        private void RpcAllocateRejected(string reason)
+        {
+            if (!isLocalPlayer) return;
+            AttributeWindowUI.Instance?.OnAllocationFailed(reason);
         }
 
         [ClientRpc]

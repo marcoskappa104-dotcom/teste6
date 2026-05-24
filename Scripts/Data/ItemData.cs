@@ -20,6 +20,13 @@ namespace RPG.Data
         Legendary
     }
 
+    [System.Serializable]
+    public struct LootEntry
+    {
+        public ItemData Item;
+        [Range(0f, 100f)]
+        public float DropChance;
+    }
 
     [CreateAssetMenu(menuName = "RPG/Item Data", fileName = "Item_New")]
     public class ItemData : ScriptableObject
@@ -46,7 +53,7 @@ namespace RPG.Data
         public Sprite Icon;
 
         [Header("Drop")]
-        [Tooltip("Peso de drop relativo. 100 = comum, 1 = raríssimo.")]
+        [Tooltip("Peso de drop relativo (usado em sorteios de pool).")]
         [Range(0, 100)]
         public int DropWeight = 10;
 

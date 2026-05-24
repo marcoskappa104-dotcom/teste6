@@ -23,9 +23,6 @@ namespace RPG.Combat
         [Tooltip("Distância mínima para considerar troca de destino na perseguição.")]
         [SerializeField] private float chaseRedirectThreshold = 0.5f;
 
-        [Header("Debug")]
-        [SerializeField] private bool debugLogs = false;
-
         private const float DEST_FRACTION      = 0.80f;
         private const float RANGE_CHECK_MARGIN = 1.05f;
         private const float CHASE_STOP_DIST    = 0.15f;
@@ -440,11 +437,25 @@ namespace RPG.Combat
             string animTrigger = !string.IsNullOrEmpty(_currentProfile.AnimTrigger)
                 ? _currentProfile.AnimTrigger
                 : "Attack";
-            _animator?.SetTrigger(animTrigger);
+            
+            CmdPlayAttackAnimation(animTrigger);
 
             _attackTarget.CmdBasicAttack(_identity.netId, _currentProfile.Range);
 
             Log($"CmdBasicAttack → {_attackTarget.DisplayName} (perfil: {_currentProfile.Type})");
+        }
+
+        [Command]
+        private void CmdPlayAttackAnimation(string triggerName)
+        {
+            RpcPlayAttackAnimation(triggerName);
+        }
+
+        [ClientRpc]
+        private void RpcPlayAttackAnimation(string triggerName)
+        {
+            if (_animator == null) return;
+            _animator.SetTrigger(triggerName);
         }
 
         // ── Helpers ────────────────────────────────────────────────────────
@@ -494,7 +505,8 @@ namespace RPG.Combat
         private void Log(string msg)
         {
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-            if (debugLogs) Debug.Log($"[BasicAttackSystem] {msg}");
+            // Log desativado para limpeza, reative se necessário
+            // Debug.Log($"[BasicAttackSystem] {msg}");
 #endif
         }
 

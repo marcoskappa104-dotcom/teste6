@@ -188,11 +188,12 @@ namespace RPG.UI
             var bonus = StatsCalculator.GetRaceBonus(SelectedRace);
             raceInfoText.text = SelectedRace switch
             {
-                CharacterRace.Human  => $"<b>Humano</b> — Equilibrado.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
-                CharacterRace.Elf    => $"<b>Elfo</b> — Magia e agilidade.\n+{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
-                CharacterRace.Dwarf  => $"<b>Anão</b> — Resistente e forte.\n+{bonus.STR} STR +{bonus.VIT} VIT",
-                CharacterRace.Orc    => $"<b>Orc</b> — Força bruta.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT",
-                CharacterRace.Undead => $"<b>Morto-Vivo</b> — Mago sombrio.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT",
+                CharacterRace.Paulista   => $"<b>Paulista</b> — Equilibrado.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
+                CharacterRace.Mineiro    => $"<b>Mineiro</b> — Resistente e forte.\n+{bonus.STR} STR +{bonus.VIT} VIT",
+                CharacterRace.Maranhense => $"<b>Maranhense</b> — Mago sombrio.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT",
+                CharacterRace.Baiano     => $"<b>Baiano</b> — Força bruta.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT",
+                CharacterRace.Cearense   => $"<b>Cearense</b> — Magia e agilidade.\n+{bonus.AGI} AGI +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
+                CharacterRace.Sergipano  => $"<b>Sergipano</b> — Versátil.\n+{bonus.STR} STR +{bonus.AGI} AGI +{bonus.VIT} VIT +{bonus.DEX} DEX +{bonus.INT} INT +{bonus.LUK} LUK",
                 _ => ""
             };
         }

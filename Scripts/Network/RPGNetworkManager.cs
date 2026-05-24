@@ -24,18 +24,22 @@ namespace RPG.Network
         // spawn). 1000 é folga generosa antes de drenar.
         private const int MAX_TRACKED_CANCELLED = 1000;
 
-        private static readonly Dictionary<CharacterRace, Vector3> RaceSpawnPoints = new()
-        {
-            { CharacterRace.Human,  new Vector3(   0f, 1f,   0f) },
-            { CharacterRace.Elf,    new Vector3(  20f, 1f,  10f) },
-            { CharacterRace.Dwarf,  new Vector3( -20f, 1f,  10f) },
-            { CharacterRace.Orc,    new Vector3(   0f, 1f,  30f) },
-            { CharacterRace.Undead, new Vector3( -20f, 1f, -10f) },
-        };
-
         [Header("Spawnable Prefabs")]
         [Tooltip("Prefabs de monstros e itens (precisam ter NetworkIdentity).")]
         [SerializeField] private List<GameObject> spawnablePrefabs = new List<GameObject>();
+
+        [System.Serializable]
+        public class RacePrefabEntry
+        {
+            public CharacterRace Race;
+            public GameObject    Prefab;
+        }
+
+        [Header("Prefabs de Jogador por Raça")]
+        [Tooltip("Prefabs específicos para cada região/raça.")]
+        [SerializeField] private List<RacePrefabEntry> racePrefabs = new List<RacePrefabEntry>();
+
+        private readonly Dictionary<CharacterRace, GameObject> _racePrefabLookup = new();
 
         [System.Serializable]
         public class WeaponProjectileEntry
@@ -81,8 +85,24 @@ namespace RPG.Network
         public override void Start()
         {
             base.Start();
+            BuildRacePrefabLookup();
             BuildProjectileLookup();
             RegisterSpawnablePrefabs();
+        }
+
+        private void BuildRacePrefabLookup()
+        {
+            _racePrefabLookup.Clear();
+            foreach (var entry in racePrefabs)
+            {
+                if (entry?.Prefab == null) continue;
+                if (_racePrefabLookup.ContainsKey(entry.Race))
+                {
+                    Debug.LogWarning($"[RPGNetworkManager] Duplicado: prefab para {entry.Race}. Mantendo primeiro.");
+                    continue;
+                }
+                _racePrefabLookup[entry.Race] = entry.Prefab;
+            }
         }
 
         private void BuildProjectileLookup()
@@ -178,6 +198,7 @@ namespace RPG.Network
             _cancelledSpawns.Clear();
 
             _prefabsRegistered = false;
+            BuildRacePrefabLookup();
             BuildProjectileLookup();
             RegisterSpawnablePrefabs();
         }
@@ -264,13 +285,17 @@ namespace RPG.Network
             CharacterData charData,
             string accountUsername)
         {
-            if (playerPrefab == null)
+            // Tenta pegar o prefab da raça, senão usa o padrão
+            _racePrefabLookup.TryGetValue(charData.Race, out var prefab);
+            if (prefab == null) prefab = playerPrefab;
+
+            if (prefab == null)
             {
-                Debug.LogError("[RPGNetworkManager] playerPrefab nulo no spawn.");
+                Debug.LogError($"[RPGNetworkManager] Nenhum prefab de jogador encontrado para {charData.Race}.");
                 conn.Send(new MsgSelectCharacterResponse
                 {
                     Success = false,
-                    Error   = "Erro interno do servidor."
+                    Error   = "Erro interno do servidor (sem prefab)."
                 });
                 return;
             }
@@ -355,7 +380,11 @@ namespace RPG.Network
                 yield break;
             }
 
-            var playerGO = Instantiate(playerPrefab, spawnPos, Quaternion.identity);
+            // Tenta pegar o prefab da raça, senão usa o padrão
+            _racePrefabLookup.TryGetValue(charData.Race, out var prefab);
+            if (prefab == null) prefab = playerPrefab;
+
+            var playerGO = Instantiate(prefab, spawnPos, Quaternion.identity);
             NetworkServer.AddPlayerForConnection(conn, playerGO);
 
             var netPlayer = playerGO.GetComponent<NetworkPlayer>();
@@ -418,18 +447,11 @@ namespace RPG.Network
 
         public Vector3 GetSpawnPositionForRace(CharacterRace race, CharacterData charData)
         {
-            var saved = new Vector3(charData.PosX, charData.PosY, charData.PosZ);
-            if (saved.sqrMagnitude > 0.01f &&
-                NavMesh.SamplePosition(saved, out NavMeshHit savedHit, 5f, NavMesh.AllAreas))
-            {
-                return savedHit.position;
-            }
+            if (charData != null && (charData.PosX != 0 || charData.PosZ != 0))
+                return new Vector3(charData.PosX, charData.PosY, charData.PosZ);
 
-            if (RaceSpawnPoints.TryGetValue(race, out Vector3 racePos))
-                return racePos;
-
-            Debug.LogWarning($"[RPGNetworkManager] Raça {race} sem spawn point. Usando origem.");
-            return Vector3.zero;
+            var spawn = GameConstants.InitialSpawn.GetSpawn(race);
+            return new Vector3(spawn.x, spawn.y, spawn.z);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -442,6 +464,14 @@ namespace RPG.Network
 
             int registered = 0;
             int skipped    = 0;
+
+            // Registra prefabs de raça
+            foreach (var entry in racePrefabs)
+            {
+                if (entry?.Prefab == null) continue;
+                if (!TryRegisterPrefab(entry.Prefab)) continue;
+                registered++;
+            }
 
             foreach (var prefab in spawnablePrefabs)
             {

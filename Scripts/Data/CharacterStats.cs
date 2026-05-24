@@ -6,11 +6,12 @@ namespace RPG.Data
     [Serializable]
     public enum CharacterRace
     {
-        Human,
-        Elf,
-        Dwarf,
-        Orc,
-        Undead
+        Paulista,
+        Mineiro,
+        Maranhense,
+        Baiano,
+        Cearense,
+        Sergipano
     }
 
     [Serializable]
@@ -157,12 +158,13 @@ namespace RPG.Data
         // (ler-apenas; não modificar os campos)
         // ══════════════════════════════════════════════════════════════════
 
-        private static readonly RaceBonus HumanBonus  = new RaceBonus { STR=2, AGI=2, VIT=2, DEX=2, INT=2, LUK=5 };
-        private static readonly RaceBonus ElfBonus    = new RaceBonus { STR=0, AGI=5, VIT=0, DEX=5, INT=5, LUK=3 };
-        private static readonly RaceBonus DwarfBonus  = new RaceBonus { STR=5, AGI=0, VIT=8, DEX=2, INT=0, LUK=2 };
-        private static readonly RaceBonus OrcBonus    = new RaceBonus { STR=8, AGI=2, VIT=5, DEX=0, INT=0, LUK=0 };
-        private static readonly RaceBonus UndeadBonus = new RaceBonus { STR=2, AGI=2, VIT=0, DEX=2, INT=8, LUK=0 };
-        private static readonly RaceBonus EmptyBonus  = new RaceBonus();
+        private static readonly RaceBonus PaulistaBonus   = new RaceBonus { STR=2, AGI=2, VIT=2, DEX=2, INT=2, LUK=5 };
+        private static readonly RaceBonus MineiroBonus    = new RaceBonus { STR=5, AGI=0, VIT=8, DEX=2, INT=0, LUK=2 };
+        private static readonly RaceBonus MaranhenseBonus = new RaceBonus { STR=2, AGI=2, VIT=0, DEX=2, INT=8, LUK=0 };
+        private static readonly RaceBonus BaianoBonus     = new RaceBonus { STR=8, AGI=2, VIT=5, DEX=0, INT=0, LUK=0 };
+        private static readonly RaceBonus CearenseBonus   = new RaceBonus { STR=0, AGI=5, VIT=0, DEX=5, INT=5, LUK=3 };
+        private static readonly RaceBonus SergipanoBonus  = new RaceBonus { STR=3, AGI=3, VIT=3, DEX=3, INT=3, LUK=3 };
+        private static readonly RaceBonus EmptyBonus      = new RaceBonus();
 
         /// <summary>
         /// Retorna o bônus de raça. A instância retornada é COMPARTILHADA
@@ -172,12 +174,13 @@ namespace RPG.Data
         {
             return race switch
             {
-                CharacterRace.Human  => HumanBonus,
-                CharacterRace.Elf    => ElfBonus,
-                CharacterRace.Dwarf  => DwarfBonus,
-                CharacterRace.Orc    => OrcBonus,
-                CharacterRace.Undead => UndeadBonus,
-                _                    => EmptyBonus
+                CharacterRace.Paulista   => PaulistaBonus,
+                CharacterRace.Mineiro    => MineiroBonus,
+                CharacterRace.Maranhense => MaranhenseBonus,
+                CharacterRace.Baiano     => BaianoBonus,
+                CharacterRace.Cearense   => CearenseBonus,
+                CharacterRace.Sergipano  => SergipanoBonus,
+                _                        => EmptyBonus
             };
         }
 

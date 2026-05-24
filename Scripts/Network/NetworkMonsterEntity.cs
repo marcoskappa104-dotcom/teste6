@@ -68,9 +68,7 @@ namespace RPG.Network
         [Header("Recompensa")]
         [SerializeField] private long expReward = 50;
 
-        [Range(0f, 100f)]
-        [SerializeField] private float dropChance = 50f;
-        [SerializeField] private List<ItemData> dropTable         = new List<ItemData>();
+        [SerializeField] private List<LootEntry> dropTable         = new List<LootEntry>();
         [SerializeField] private List<string>   guaranteedDropIds = new List<string>();
 
         [Header("Visuals")]
@@ -98,8 +96,8 @@ namespace RPG.Network
         [SyncVar]                                    private float _maxHP;
         [SyncVar(hook = nameof(OnDeadChanged))]      private bool  _isDead;
         [SyncVar(hook = nameof(OnIsMovingChanged))]  private bool  _isMoving;
-
         [SyncVar] private int _spawnGeneration = 0;
+
         public int SpawnGeneration => _spawnGeneration;
 
         // ── ITargetable ────────────────────────────────────────────────────
@@ -139,6 +137,8 @@ namespace RPG.Network
         private Vector3 _homePosition;
         private float   _patrolRadiusRuntime;
         private bool    _serverResetDone;
+        private NetworkMonsterSpawner _spawner;
+        private GameObject            _monsterPrefab;
 
         private int            _targetableLayerMask;
         private WaitForSeconds _aggroScanWait;
@@ -147,9 +147,6 @@ namespace RPG.Network
         private WaitForSeconds _damageLogCleanupWait;
 
         private Collider[] _aggroOverlapBuffer;
-
-        // FIX: cache do collider principal para desativar na morte
-        private Collider _mainCollider;
 
         private float _lastIsMovingUpdateTime;
 
@@ -175,11 +172,6 @@ namespace RPG.Network
         {
             _agent    = GetComponent<NavMeshAgent>();
             _animator = GetComponentInChildren<Animator>();
-
-            // FIX: cacheia o collider principal para desativar/ativar na morte/respawn
-            _mainCollider = GetComponent<Collider>();
-            if (_mainCollider == null)
-                _mainCollider = GetComponentInChildren<Collider>();
 
             baseSTR = Mathf.Max(1, baseSTR);
             baseAGI = Mathf.Max(1, baseAGI);
@@ -215,13 +207,12 @@ namespace RPG.Network
 
         public override void OnStartClient()
         {
+            // Desativa NavMeshAgent no cliente para evitar erros de NavMesh (só o servidor move)
+            if (_agent != null) _agent.enabled = false;
+
             if (selectionIndicator) selectionIndicator.SetActive(false);
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
             if (visualRoot) visualRoot.SetActive(true);
-
-            // FIX: garante que o collider está ativo ao spawnar
-            if (_mainCollider != null) _mainCollider.enabled = true;
-
             RestoreVisualsAlpha();
         }
 
@@ -236,12 +227,28 @@ namespace RPG.Network
         }
 
         [Server]
-        public void SetSpawnData(Vector3 homePos, float newPatrolRadius)
+        public void SetupMonster(NetworkMonsterSpawner spawner, Vector3 homePos, float newPatrolRadius, GameObject prefab = null)
         {
+            _spawner             = spawner;
             _homePosition        = homePos;
             _patrolRadiusRuntime = Mathf.Max(0f, newPatrolRadius);
             transform.position   = homePos;
             _patrolTargetSet     = false;
+            
+            if (prefab != null)
+            {
+                _monsterPrefab = prefab;
+            }
+            // Tenta encontrar o prefab original via NetworkIdentity se não foi passado
+            else if (_monsterPrefab == null)
+            {
+                var ni = GetComponent<NetworkIdentity>();
+                if (ni != null && NetworkClient.prefabs.TryGetValue(ni.assetId, out GameObject registeredPrefab))
+                {
+                    _monsterPrefab = registeredPrefab;
+                }
+            }
+
             StartCoroutine(ServerResetNextFrame());
         }
 
@@ -275,8 +282,23 @@ namespace RPG.Network
 
             _kiteDistance = attackRange * kiteDistanceFraction;
 
+            // REATIVA COLLIDER
+            Collider col = GetComponent<Collider>();
+            if (col != null)
+                col.enabled = true;
+
+            // RESTAURA LAYER "Targetable"
+            int targetableLayer = LayerMask.NameToLayer("Targetable");
+            if (targetableLayer >= 0) gameObject.layer = targetableLayer;
+
+            // REATIVA NETWORK TRANSFORM
+            var nt = GetComponent<NetworkTransformUnreliable>();
+            if (nt != null)
+                nt.enabled = true;
+
             if (_agent != null)
             {
+                // Garante que o agente está ativo no servidor
                 _agent.enabled          = true;
                 _agent.speed            = _stats.MoveSpeed;
                 _agent.angularSpeed     = 360f;
@@ -294,7 +316,7 @@ namespace RPG.Network
             _aggroScanCoroutine        = StartCoroutine(AggroScanLoop());
             _pathUpdateCoroutine       = StartCoroutine(PathUpdateLoop());
             _damageLogCleanupCoroutine = StartCoroutine(DamageLogCleanupLoop());
-            RpcOnRespawned();
+            // RpcOnRespawned será chamado pelo ServerDeathSequence após o NetworkServer.Spawn
         }
 
         [Server]
@@ -318,8 +340,10 @@ namespace RPG.Network
             if (!_serverResetDone) { ServerReset(); return; }
             if (_isDead) return;
 
-            _attackAccumulator += Time.deltaTime;
+            float deltaTime = Time.deltaTime;
+            _attackAccumulator += deltaTime;
 
+            // Sincroniza estado de movimento com frequência reduzida
             if (Time.time - _lastIsMovingUpdateTime >= MOVING_UPDATE_INTERVAL)
             {
                 _lastIsMovingUpdateTime = Time.time;
@@ -327,9 +351,11 @@ namespace RPG.Network
                 if (moving != _isMoving) _isMoving = moving;
             }
 
+            // Otimização: processa a lógica de IA baseada no estado
+            // Estados como Chase e Combat exigem precisão, outros podem ser mais leves
             switch (_state)
             {
-                case AIState.Idle:       break;
+                case AIState.Idle:   break;
                 case AIState.Patrol:
                     if (usePatrolPoints) ServerPatrolWaypoints();
                     break;
@@ -344,6 +370,11 @@ namespace RPG.Network
         // Coroutines de IA
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// FIX: AggroScanLoop agora verifica _serverResetDone antes de escanear.
+        /// Antes podia tentar escanear antes que o reset estivesse completo,
+        /// causando comportamento inconsistente no primeiro ciclo de vida.
+        /// </summary>
         [Server]
         private IEnumerator AggroScanLoop()
         {
@@ -351,7 +382,9 @@ namespace RPG.Network
             {
                 if (this == null || !isServer) yield break;
 
-                if (!_isDead && (_state == AIState.Idle || _state == AIState.Patrol))
+                // FIX: aguarda reset estar completo antes de escanear
+                if (_serverResetDone && !_isDead
+                    && (_state == AIState.Idle || _state == AIState.Patrol))
                 {
                     if (disposition == MonsterDisposition.Aggressive)
                         TryAggro();
@@ -423,6 +456,11 @@ namespace RPG.Network
             }
         }
 
+        /// <summary>
+        /// FIX: limpa entradas do damageLog de jogadores mortos ou muito distantes.
+        /// A versão anterior não limpava jogadores mortos (apenas desconectados/distantes),
+        /// causando acúmulo de entradas em encontros longos com muitas mortes.
+        /// </summary>
         [Server]
         private void CleanupOrphanedDamageEntries()
         {
@@ -446,8 +484,15 @@ namespace RPG.Network
                     {
                         orphaned = true;
                     }
-                    else if (!np.Dead
-                             && Vector3.Distance(np.transform.position, transform.position) > maxDist)
+                    else if (np.Dead)
+                    {
+                        // FIX: jogadores mortos também são considerados órfãos para limpeza
+                        // periódica. Eles ainda recebem XP ao morrer o monstro se
+                        // contribuíram com dano — mas seus registros podem ser limpos
+                        // depois do DAMAGE_LOG_CLEANUP_INTERVAL para liberar memória.
+                        orphaned = true;
+                    }
+                    else if (Vector3.Distance(np.transform.position, transform.position) > maxDist)
                     {
                         orphaned = true;
                     }
@@ -892,6 +937,10 @@ namespace RPG.Network
             attacker.ServerConsumeMP(skill.ManaCost);
             ServerTakeDamageFromPlayer(attacker, atkStats, isPhysical, skill);
             attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
+
+            // SINCRONIZA ANIMAÇÃO PARA TODOS
+            if (!string.IsNullOrEmpty(skill.AnimTrigger))
+                attacker.RpcPlayAnimation(skill.AnimTrigger);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -918,7 +967,7 @@ namespace RPG.Network
             var inventory = attacker.GetComponent<NetworkInventory>();
             WeaponAttackProfile profile = ResolveServerWeaponProfile(inventory);
 
-            float serverRange = profile.Range;
+            float serverRange    = profile.Range;
             float effectiveRange = Mathf.Min(
                 Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE),
                 serverRange);
@@ -983,6 +1032,10 @@ namespace RPG.Network
 
             dmg = SanitizeDamage(dmg);
             dmg = Mathf.Max(1f, dmg);
+
+            // SINCRONIZA ANIMAÇÃO DE ATAQUE PARA TODOS
+            if (!string.IsNullOrEmpty(profile.AnimTrigger))
+                attacker.RpcPlayAnimation(profile.AnimTrigger);
 
             if (profile.UsesProjectile)
             {
@@ -1144,17 +1197,27 @@ namespace RPG.Network
         // Morte e respawn
         // ══════════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// FIX: guarda dupla de _deathProcessed no início do método.
+        /// Antes havia uma pequena janela onde dois hits simultâneos podiam
+        /// passar pelo if inicial se chegassem no mesmo frame, antes de
+        /// _deathProcessed ser definido como true.
+        /// </summary>
         [Server]
         private void ServerDie()
         {
+            // Dupla guarda: _deathProcessed é definido ANTES de qualquer trabalho
             if (_deathProcessed) return;
+            Vector3 deathPos = transform.position;
             _deathProcessed = true;
-            _isDead         = true;
-            _isMoving       = false;
-            _state          = AIState.Dead;
+
+            _isDead   = true;
+            _isMoving = false;
+            _state    = AIState.Dead;
 
             CancelAllAICoroutines();
 
+            // DESATIVA NAVMESH
             if (_agent != null)
             {
                 if (_agent.isOnNavMesh)
@@ -1165,10 +1228,24 @@ namespace RPG.Network
                 _agent.enabled = false;
             }
 
+            // DESATIVA COLLIDER
+            Collider col = GetComponent<Collider>();
+            if (col != null)
+                col.enabled = false;
+
+            // TROCA LAYER PARA "Dead"
+            int deadLayer = LayerMask.NameToLayer("Dead");
+            if (deadLayer >= 0) gameObject.layer = deadLayer;
+
+            // DESATIVA NETWORK TRANSFORM
+            var nt = GetComponent<NetworkTransformUnreliable>();
+            if (nt != null)
+                nt.enabled = false;
+
             ServerDistributeExp();
 
             RPG.Managers.ItemDropManager.Instance?.ServerSpawnDrop(
-                transform.position, dropChance,
+                deathPos + Vector3.up * 0.5f,
                 dropTable.Count > 0 ? dropTable : null,
                 guaranteedDropIds.Count > 0 ? guaranteedDropIds : null);
 
@@ -1188,7 +1265,10 @@ namespace RPG.Network
             {
                 long xp = (long)Mathf.Max(1f, expReward * (kv.Value / total));
                 var  np = FindPlayerByNetId(kv.Key);
-                if (np == null || np.Dead) continue;
+
+                // FIX: distribui XP mesmo para jogadores mortos (que contribuíram com dano
+                // antes de morrer). Isso é mais justo e consistente com outros MMOs.
+                if (np == null) continue;
 
                 np.ServerGrantExp(xp);
 
@@ -1206,46 +1286,23 @@ namespace RPG.Network
         {
             if (this == null) yield break;
 
-            // FIX: envia RPC de morte para todos os clientes (desativa collider, inicia fade)
             RpcOnDied(transform.position);
 
-            // FIX: aguarda o fade do corpo no cliente antes de destruir/respawnar
-            // bodyFadeDelay + bodyFadeDuration = tempo total do fade no cliente
-            float clientFadeTotal = bodyFadeDelay + bodyFadeDuration + 0.5f; // 0.5s de margem
+            // Aguarda o tempo do fade visual antes de sumir da rede
+            float fadeWait = bodyFadeDelay + bodyFadeDuration + 0.5f;
+            yield return new WaitForSeconds(fadeWait);
 
-            if (respawnDelay <= 0f)
+            if (this != null && isServer)
             {
-                // Sem respawn: aguarda o fade e destrói o objeto
-                yield return new WaitForSeconds(clientFadeTotal);
+                // Notifica o spawner para agendar o respawn ANTES de destruir
+                if (_spawner != null && _monsterPrefab != null)
+                {
+                    _spawner.ServerNotifyDeath(_monsterPrefab, _homePosition, _patrolRadiusRuntime, respawnDelay);
+                }
 
-                _deathSequenceCoroutine = null;
-
-                if (this != null && isServer)
-                    NetworkServer.Destroy(gameObject);
-
-                yield break;
+                // Destrói o monstro no servidor (isso removerá de todos os clientes automaticamente)
+                NetworkServer.Destroy(gameObject);
             }
-
-            // Com respawn: aguarda o respawnDelay e reinicia
-            yield return new WaitForSeconds(respawnDelay);
-
-            if (this == null || !isServer)
-            {
-                _deathSequenceCoroutine = null;
-                yield break;
-            }
-
-            _deathSequenceCoroutine = null;
-            StartCoroutine(DelayedRespawn());
-        }
-
-        [Server]
-        private IEnumerator DelayedRespawn()
-        {
-            yield return null;
-            if (this == null || !isServer) yield break;
-            _serverResetDone = false;
-            ServerReset();
         }
 
         private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
@@ -1298,18 +1355,12 @@ namespace RPG.Network
                 crit ? new Color(1f, 0.3f, 0f) : new Color(1f, 0.2f, 0.2f));
         }
 
-        // FIX: RpcOnDied agora desativa o collider imediatamente, impedindo que
-        // o monstro morto seja clicado ou detectado por raycast em outros clientes.
         [ClientRpc]
         private void RpcOnDied(Vector3 pos)
         {
             if (Application.isBatchMode) return;
 
             OnDeselected();
-
-            // FIX: desativa o collider para que o monstro não seja mais clicável
-            if (_mainCollider != null) _mainCollider.enabled = false;
-
             if (healthBarUI != null) healthBarUI.gameObject.SetActive(false);
 
             var localPlayerGO = NetworkClient.localPlayer;
@@ -1392,8 +1443,6 @@ namespace RPG.Network
                 }
             }
 
-            // FIX: ao terminar o fade, desativa o visualRoot
-            // (o NetworkServer.Destroy cuidará de remover o objeto da rede)
             if (this != null && visualRoot != null)
                 visualRoot.SetActive(false);
 
@@ -1417,7 +1466,6 @@ namespace RPG.Network
                 if (r != null) r.SetPropertyBlock(null);
         }
 
-        // FIX: RpcOnRespawned reativa o collider ao respawnar
         [ClientRpc]
         private void RpcOnRespawned()
         {
@@ -1431,9 +1479,6 @@ namespace RPG.Network
 
             ReleaseFadeMaterials();
             RestoreVisualsAlpha();
-
-            // FIX: reativa o collider para que o monstro possa ser clicado novamente
-            if (_mainCollider != null) _mainCollider.enabled = true;
 
             if (visualRoot)         visualRoot.SetActive(true);
             if (selectionIndicator) selectionIndicator.SetActive(false);
