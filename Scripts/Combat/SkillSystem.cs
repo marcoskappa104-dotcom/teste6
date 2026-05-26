@@ -22,6 +22,7 @@ namespace RPG.Combat
         public float       Cooldown      = 3f;
         public float       ManaCost      = 10f;
         public float       Range         = 4f;
+        public float       AoERadius     = 0f; // 0 = Single Target
         public float       AtkMultiplier = 1.0f;
         public float       CastTime      = 0f;
         public string      AnimTrigger   = "Attack";
@@ -67,6 +68,11 @@ namespace RPG.Combat
         private ITargetable _castTarget;
         private float       _lastCmdMoveTime;
         private Vector3     _lastWalkDestination = Vector3.positiveInfinity;
+
+        // --- Input Buffering ---
+        private int   _bufferedSkillIndex = -1;
+        private float _bufferTimestamp    = -1f;
+        private const float INPUT_BUFFER_WINDOW = 0.5f; // Janela de 500ms para o buffer
 
         // ── Subscrições para cleanup ───────────────────────────────────────
         private bool _subscribedToPlayerEvents;
@@ -190,6 +196,21 @@ namespace RPG.Combat
                 if (_uiCooldownTimers[i] > 0f)
                     _uiCooldownTimers[i] -= Time.deltaTime;
 
+            // --- Process Input Buffer ---
+            if (_bufferedSkillIndex != -1)
+            {
+                if (Time.time - _bufferTimestamp > INPUT_BUFFER_WINDOW)
+                {
+                    _bufferedSkillIndex = -1; // Buffer expirou
+                }
+                else if (!_isCasting && !_hasPendingWalk)
+                {
+                    int index = _bufferedSkillIndex;
+                    _bufferedSkillIndex = -1;
+                    TryUseSkill(index);
+                }
+            }
+
             // Belt-and-suspenders: garante limpeza mesmo se eventos não dispararam
             if ((_hasPendingWalk || _isCasting) && _player.IsDead)
             {
@@ -222,7 +243,14 @@ namespace RPG.Combat
             if (!isLocalPlayer) return;
             if (index < 0 || index >= MAX_SKILLS) return;
             if (!_player.IsInitialized || _player.IsDead) return;
-            if (_isCasting) return;
+
+            // Se estiver castando ou andando, coloca na fila (Input Buffer)
+            if (_isCasting || _hasPendingWalk)
+            {
+                _bufferedSkillIndex = index;
+                _bufferTimestamp    = Time.time;
+                return;
+            }
 
             var skill = GetSkill(index);
             if (skill == null)

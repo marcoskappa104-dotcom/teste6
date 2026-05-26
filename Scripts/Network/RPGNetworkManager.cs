@@ -77,6 +77,8 @@ namespace RPG.Network
 
         private bool              _prefabsRegistered;
         private ServerAuthManager _authManager;
+        private PartyManager      _partyManager;
+        private ChatManager       _chatManager;
 
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
@@ -149,6 +151,15 @@ namespace RPG.Network
         {
             base.OnStartServer();
 
+            // Adiciona Interest Management (Spatial Hashing) programaticamente se não houver um
+            if (GetComponent<InterestManagement>() == null)
+            {
+                var spatial = gameObject.AddComponent<SpatialHashingInterestManagement>();
+                spatial.visRange = 60; // Range de visão do jogador
+                spatial.rebuildInterval = 0.5f; // Frequência de atualização (2x por segundo)
+                Debug.Log("[RPGNetworkManager] Interest Management (Spatial Hashing) configurado.");
+            }
+
             if (playerPrefab == null)
                 Debug.LogError("[RPGNetworkManager] playerPrefab não configurado!");
 
@@ -157,6 +168,18 @@ namespace RPG.Network
                 _authManager = gameObject.AddComponent<ServerAuthManager>();
 
             _authManager.RegisterHandlers();
+
+            _partyManager = GetComponent<PartyManager>();
+            if (_partyManager == null)
+                _partyManager = gameObject.AddComponent<PartyManager>();
+
+            _partyManager.RegisterHandlers();
+
+            _chatManager = GetComponent<ChatManager>();
+            if (_chatManager == null)
+                _chatManager = gameObject.AddComponent<ChatManager>();
+
+            _chatManager.RegisterHandlers();
 
             NetworkServer.RegisterHandler<MsgClientSceneReady>(OnClientSceneReady, false);
 

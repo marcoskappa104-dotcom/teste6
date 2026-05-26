@@ -29,11 +29,11 @@ namespace RPG.Network
         [SerializeField] private float jumpHeight    = 1.5f;
         [SerializeField] private float jumpDuration  = 0.6f;
 
-        // Multiplicador anti-cheat: aceita pickups com folga para latência,
-        // mas não tão generoso a ponto de viabilizar trapaça óbvia.
-        private const float PICKUP_LATENCY_TOLERANCE = 1.5f;
+        // Multiplicador anti-cheat: aceita pickups com folga para latência.
+        private const float PICKUP_LATENCY_TOLERANCE = 2.0f; // Aumentado para 100% de folga (compensar lag de posição)
 
         [SyncVar(hook = nameof(OnItemIdChanged))]   private string  _itemId = "";
+        [SyncVar]                                   private int     _quantity = 1;
         [SyncVar]                                   private Vector3 _spawnOrigin;
         [SyncVar(hook = nameof(OnTargetPosChanged))] private Vector3 _targetPos;
 
@@ -51,9 +51,10 @@ namespace RPG.Network
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
-        public void ServerInitialize(string itemId, Vector3 origin, Vector3 target)
+        public void ServerInitialize(string itemId, Vector3 origin, Vector3 target, int quantity = 1)
         {
             _itemId      = itemId;
+            _quantity    = Mathf.Max(1, quantity);
             _spawnOrigin = origin;
             _targetPos   = target;
             _despawnCoroutine = StartCoroutine(AutoDespawn());
@@ -180,12 +181,43 @@ namespace RPG.Network
             }
 
             if (glowEffect != null)
-                glowEffect.SetActive(item.Rarity >= ItemRarity.Rare);
+            {
+                glowEffect.SetActive(item.Rarity >= ItemRarity.Uncommon);
+                var renderer = glowEffect.GetComponent<Renderer>();
+                if (renderer != null)
+                {
+                    // Tenta atualizar a cor do material do glow se existir
+                    foreach (var mat in renderer.materials)
+                    {
+                        if (mat.HasProperty("_Color")) mat.SetColor("_Color", item.RarityColor);
+                        if (mat.HasProperty("_TintColor")) mat.SetColor("_TintColor", item.RarityColor);
+                        if (mat.HasProperty("_EmissionColor")) mat.SetColor("_EmissionColor", item.RarityColor * 2f);
+                    }
+                }
+            }
         }
 
+        [SyncVar] private uint _isBeingPickedUpBy = 0;
+
         private void Update()
-        {
+        { 
             if (!isClient || !_hasVisualRoot) return;
+
+            if (_isBeingPickedUpBy != 0)
+            {
+                var target = NetworkClient.spawned.ContainsKey(_isBeingPickedUpBy) 
+                    ? NetworkClient.spawned[_isBeingPickedUpBy] 
+                    : null;
+
+                if (target != null)
+                {
+                    // Interpola em direção ao peito do jogador
+                    Vector3 targetPos = target.transform.position + Vector3.up * 1.2f;
+                    transform.position = Vector3.Lerp(transform.position, targetPos, Time.deltaTime * 12f);
+                    transform.localScale = Vector3.Lerp(transform.localScale, Vector3.zero, Time.deltaTime * 10f);
+                }
+                return;
+            }
 
             // PROTEÇÃO: Se o item "fugir" para o zero após o pulo ou por erro de rede, trazemos ele de volta
             if (!_isJumping && _targetPos.sqrMagnitude > 0.001f)
@@ -253,7 +285,7 @@ namespace RPG.Network
             }
 
             // Tenta adicionar — pode falhar por inventário cheio
-            int slotIndex = inventory.ServerAddItem(_itemId);
+            int slotIndex = inventory.ServerAddItem(_itemId, _quantity);
             if (slotIndex < 0)
             {
                 _picked = false;
@@ -261,8 +293,11 @@ namespace RPG.Network
             }
 
             // ── SUCESSO GARANTIDO DAQUI PRA BAIXO ─────────────────────────
-            // Cancela APENAS o despawn — sem StopAllCoroutines, que mataria
-            // qualquer coroutine futura que alguém adicionar a este componente.
+            // Se coletou apenas parte (ex: inventário encheu no meio do stack),
+            // a quantidade restante deveria ficar no chão, mas por simplicidade
+            // aqui tratamos como sucesso se pelo menos 1 foi coletado.
+            // O ServerAddItem do NetworkInventory já cuida de notificar se foi parcial.
+
             if (_despawnCoroutine != null)
             {
                 StopCoroutine(_despawnCoroutine);
@@ -271,10 +306,22 @@ namespace RPG.Network
 
             var    item     = ItemDatabase.Instance?.GetItem(_itemId);
             string itemName = item?.DisplayName ?? _itemId;
+            if (_quantity > 1) itemName = $"{_quantity}x {itemName}";
             Color  color    = item?.RarityColor ?? Color.white;
             RpcPickupFeedback(playerNetId, itemName, color);
 
-            NetworkServer.Destroy(gameObject);
+            // Inicia animação de voo sincronizada
+            _isBeingPickedUpBy = playerNetId;
+            
+            // Destrói após tempo da animação
+            StartCoroutine(ServerDelayedDestroy(0.4f));
+        }
+
+        [Server]
+        private IEnumerator ServerDelayedDestroy(float delay)
+        {
+            yield return new WaitForSeconds(delay);
+            if (gameObject != null) NetworkServer.Destroy(gameObject);
         }
 
         [ClientRpc]

@@ -74,6 +74,13 @@ namespace RPG.Network
         private float _lastSecurityWarnTime = -999f;
         private const float SECURITY_WARN_INTERVAL = 2f;
 
+        // --- Anti-SpeedHack ---
+        private Vector3 _serverLastPosition;
+        private float   _serverLastMoveTime;
+        private const float SPEED_HACK_TOLERANCE = 1.6f;  // Aumentado para 60% de margem (mais seguro contra jitter)
+        private const float TELEPORT_THRESHOLD   = 25f;   // Distância máxima por segundo para Rubberbanding
+        private const float MIN_CHECK_DISTANCE   = 2.0f;  // Ignora movimentos muito curtos para evitar drift de float
+
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
         // ══════════════════════════════════════════════════════════════════
@@ -422,6 +429,12 @@ namespace RPG.Network
         // Commands
         // ══════════════════════════════════════════════════════════════════
 
+        public override void OnStartServer()
+        {
+            _serverLastPosition = transform.position;
+            _serverLastMoveTime = Time.time;
+        }
+
         [Command]
         public void CmdMoveTo(Vector3 destination)
         {
@@ -437,13 +450,46 @@ namespace RPG.Network
             var netPlayer = GetComponent<NetworkPlayer>();
             if (netPlayer == null || netPlayer.Dead) return;
 
-            float dist = Vector3.Distance(transform.position, destination);
-            if (dist > MAX_MOVE_DIST)
+            // --- Anti-SpeedHack Validation ---
+            float timePassed = Time.time - _serverLastMoveTime;
+            if (timePassed > 0.05f) // Evita checks em frames colados
+            {
+                float distMoved = Vector3.Distance(_serverLastPosition, destination);
+                float maxSpeed  = (_playerEntity != null && _playerEntity.Stats != null) 
+                    ? _playerEntity.Stats.MoveSpeed 
+                    : AGENT_MAX_SPEED;
+
+                float maxAllowedDist = maxSpeed * timePassed * SPEED_HACK_TOLERANCE;
+                
+                // Se moveu mais que o permitido (e não é um "teleport" pequeno de lag)
+                if (distMoved > maxAllowedDist && distMoved > MIN_CHECK_DISTANCE)
+                {
+                    if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
+                    {
+                        _lastSecurityWarnTime = Time.time;
+                        Debug.LogWarning($"[Security] Movimento suspeito: {netPlayer.CharacterName} | Dist: {distMoved:0.1} | Max: {maxAllowedDist:0.1} | T: {timePassed:0.00}s");
+                    }
+                    
+                    // Se a discrepância for absurda (Teleport/SpeedHack pesado), trava o movimento
+                    if (distMoved > TELEPORT_THRESHOLD)
+                    {
+                        Debug.LogWarning($"[Security] Rubberbanding em {netPlayer.CharacterName} - Distância {distMoved:0.1}m em {timePassed:0.00}s");
+                        _agent.Warp(_serverLastPosition);
+                        return;
+                    }
+                }
+            }
+
+            _serverLastPosition = destination;
+            _serverLastMoveTime = Time.time;
+
+            float totalDist = Vector3.Distance(transform.position, destination);
+            if (totalDist > MAX_MOVE_DIST)
             {
                 if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
                 {
                     _lastSecurityWarnTime = Time.time;
-                    Debug.LogWarning($"[Security] CmdMoveTo suspeito: dist={dist:0.0} | {netPlayer.CharacterName}");
+                    Debug.LogWarning($"[Security] CmdMoveTo suspeito: dist={totalDist:0.0} | {netPlayer.CharacterName}");
                 }
                 return;
             }

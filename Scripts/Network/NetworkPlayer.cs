@@ -12,20 +12,18 @@ using RPG.Combat;
 
 namespace RPG.Network
 {
-
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
     [RequireComponent(typeof(NetworkInventory))]
+    [RequireComponent(typeof(PlayerCooldownTracker))]
+    [RequireComponent(typeof(PlayerRegenLoop))]
     public class NetworkPlayer : NetworkBehaviour, ITargetable
     {
         public static readonly HashSet<NetworkPlayer> All = new HashSet<NetworkPlayer>();
 
-        private const float SAVE_INTERVAL                = 60f;
-        private const float REGEN_INTERVAL               = 5f;
+        private const float SAVE_INTERVAL                = 30f; // Reduzido de 60s para 30s para maior segurança
         private const float ALLOCATE_MIN_INTERVAL        = 0.3f;
-        private const float REGEN_COMBAT_SUPPRESSION     = 8f;
         private const float REGEN_DISPLAY_THRESHOLD      = 1f;
-        private const float COOLDOWN_CLEANUP_INTERVAL    = 60f;
         private const int   MAX_FREE_POINTS              = CharacterData.MAX_LEVEL * CharacterData.POINTS_PER_LEVEL_UP;
 
         private const float AGENT_ACCELERATION   = 60f;
@@ -61,11 +59,8 @@ namespace RPG.Network
         [SyncVar(hook = nameof(OnNetExpChanged))]        public long   Experience            = 0;
         [SyncVar(hook = nameof(OnNetExpToNextChanged))]  public long   ExperienceToNextLevel = 100;
         [SyncVar(hook = nameof(OnNetFreePointsChanged))] public int    FreeAttributePoints   = 0;
-
-        // FIX: StatsVersion dispara FullRefresh no cliente. Os hooks de AllocXxx
-        // apenas marcam _allocDirty (processado no Update), para evitar múltiplos
-        // FullRefresh no mesmo frame quando vários SyncVars chegam juntos.
         [SyncVar(hook = nameof(OnStatsVersionChanged))]  public int    StatsVersion          = 0;
+        [SyncVar]                                        public int    PartyId               = 0; // 0 = Sem grupo
 
         [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedSTR = 0;
         [SyncVar(hook = nameof(OnAllocChanged))] public int AllocatedAGI = 0;
@@ -98,44 +93,33 @@ namespace RPG.Network
         [Header("Respawn Points")]
         [SerializeField] private Transform[] _respawnPoints;
 
+        // ── Componentes ────────────────────────────────────────────────────
         private NavMeshAgent           _agent;
         private Animator               _animator;
         private PlayerEntity           _playerEntity;
         private NetworkInventory       _inventory;
         private RPG.Quest.QuestManager _questManager;
+        private PlayerCooldownTracker  _cooldowns;
+        private PlayerRegenLoop        _regenLoop;
 
+        // ── Estado servidor ───────────────────────────────────────────────
         private CharacterData _serverCharData;
         private DerivedStats  _serverStats;
         private string        _serverAccountUsername;
         private float         _autoSaveTimer;
         private float         _lastAllocateTime         = -999f;
-        private float         _lastDamageTime           = -999f;
-        private float         _lastCooldownCleanupTime  = 0f;
         private bool          _isDirty;
 
         public DerivedStats ServerStats => _serverStats;
 
-        private readonly Dictionary<int, float>  _serverSkillCooldowns       = new();
-        private readonly Dictionary<long, float> _serverBasicAttackCooldowns = new();
-
-        private readonly List<int>  _cooldownCleanupBufferInt  = new(8);
-        private readonly List<long> _cooldownCleanupBufferLong = new(8);
-
-        private Coroutine _regenCoroutine;
-
+        // ── Estado cliente ────────────────────────────────────────────────
         private CharacterRace _cachedRace = CharacterRace.Paulista;
-
         private bool          _clientInitialized;
         private bool          _pendingClientInit;
         private CharacterData _pendingInitData;
-
-        // FIX: _allocDirty é marcado por QUALQUER hook de AllocXxx via OnAllocChanged.
-        // _equipDirty é marcado pelo evento de inventário.
-        // Processados no Update para consolidar vários SyncVars chegando no mesmo frame.
-        private bool _allocDirty;
-        private bool _equipDirty;
-
-        private float       _lastMovingCmdTime;
+        private bool          _allocDirty;
+        private bool          _equipDirty;
+        private float         _lastMovingCmdTime;
         private const float MOVING_CMD_INTERVAL = 0.1f;
 
         public bool Dead => CurrentHP <= 0f;
@@ -151,19 +135,28 @@ namespace RPG.Network
             _playerEntity = GetComponent<PlayerEntity>();
             _inventory    = GetComponent<NetworkInventory>();
             _questManager = GetComponent<RPG.Quest.QuestManager>();
+            _cooldowns    = GetComponent<PlayerCooldownTracker>();
+            _regenLoop    = GetComponent<PlayerRegenLoop>();
         }
 
         public override void OnStartServer()
         {
             All.Add(this);
-            _autoSaveTimer           = SAVE_INTERVAL;
-            _lastCooldownCleanupTime = Time.time;
+            _autoSaveTimer = SAVE_INTERVAL;
+            _cooldowns?.ServerReset();
+
+            // Conecta callbacks de regen
+            _regenLoop.SnapshotProvider = BuildRegenSnapshot;
+            _regenLoop.ApplyRegen       = ApplyRegenValues;
+            _regenLoop.OnRegenTick      += OnServerRegenTick;
         }
 
         public override void OnStopServer()
         {
             All.Remove(this);
-            StopRegenLoop();
+            _regenLoop?.Stop();
+            if (_regenLoop != null)
+                _regenLoop.OnRegenTick -= OnServerRegenTick;
 
             if (_serverCharData != null && !string.IsNullOrEmpty(_serverAccountUsername))
                 ServerSaveCharacterForced();
@@ -235,29 +228,7 @@ namespace RPG.Network
                 if (_isDirty) ServerSaveCharacterForced();
             }
 
-            if (Time.time - _lastCooldownCleanupTime >= COOLDOWN_CLEANUP_INTERVAL)
-            {
-                _lastCooldownCleanupTime = Time.time;
-                CleanupExpiredCooldowns();
-            }
-        }
-
-        [Server]
-        private void CleanupExpiredCooldowns()
-        {
-            float now = Time.time;
-
-            _cooldownCleanupBufferInt.Clear();
-            foreach (var kv in _serverSkillCooldowns)
-                if (kv.Value <= now) _cooldownCleanupBufferInt.Add(kv.Key);
-            foreach (var k in _cooldownCleanupBufferInt)
-                _serverSkillCooldowns.Remove(k);
-
-            _cooldownCleanupBufferLong.Clear();
-            foreach (var kv in _serverBasicAttackCooldowns)
-                if (kv.Value <= now) _cooldownCleanupBufferLong.Add(kv.Key);
-            foreach (var k in _cooldownCleanupBufferLong)
-                _serverBasicAttackCooldowns.Remove(k);
+            _cooldowns?.ServerTick();
         }
 
         private void ClientMovingUpdate()
@@ -299,7 +270,6 @@ namespace RPG.Network
                 Debug.LogError("[NetworkPlayer] ServerInitialize: dados inválidos.");
                 return;
             }
-
             if (string.IsNullOrEmpty(charData.CharacterId))
             {
                 Debug.LogError("[NetworkPlayer] ServerInitialize: CharacterId vazio.");
@@ -370,7 +340,7 @@ namespace RPG.Network
             }
 
             ConfigureServerAgent();
-            StartRegenLoop();
+            _regenLoop?.ServerStart();
 
             Debug.Log($"[Server] {charData.CharacterName} Lv{Level} inicializado.");
             StartCoroutine(SendInitRpcDelayed(charData));
@@ -409,7 +379,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Mudança de equipamento
+        // Equipamento / stats
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
@@ -437,74 +407,39 @@ namespace RPG.Network
             _serverCharData.CurrentMP = CurrentMP;
 
             ConfigureServerAgent();
-
             StatsVersion++;
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Regen
+        // Regen — callbacks fornecidos ao PlayerRegenLoop
         // ══════════════════════════════════════════════════════════════════
 
-        [Server]
-        private void StartRegenLoop()
+        private PlayerRegenLoop.RegenSnapshot BuildRegenSnapshot()
         {
-            StopRegenLoop();
-            _regenCoroutine = StartCoroutine(ServerRegenLoop());
+            return new PlayerRegenLoop.RegenSnapshot
+            {
+                IsDead    = Dead,
+                CurrentHP = CurrentHP, MaxHP = MaxHP,
+                CurrentMP = CurrentMP, MaxMP = MaxMP,
+                Stats     = _serverStats
+            };
         }
 
         [Server]
-        private void StopRegenLoop()
+        private void ApplyRegenValues(float newHP, float newMP)
         {
-            if (_regenCoroutine != null)
+            CurrentHP = newHP;
+            CurrentMP = newMP;
+            if (_serverCharData != null)
             {
-                StopCoroutine(_regenCoroutine);
-                _regenCoroutine = null;
+                _serverCharData.CurrentHP = CurrentHP;
+                _serverCharData.CurrentMP = CurrentMP;
             }
         }
 
-        [Server]
-        private IEnumerator ServerRegenLoop()
+        private void OnServerRegenTick(float hpRestored, float mpRestored)
         {
-            var wait = new WaitForSeconds(REGEN_INTERVAL);
-            while (true)
-            {
-                yield return wait;
-
-                if (this == null || !isServer) yield break;
-                if (Dead) continue;
-
-                // Otimização: se HP e MP estão cheios, não processa nada
-                if (CurrentHP >= MaxHP - 0.01f && CurrentMP >= MaxMP - 0.01f)
-                    continue;
-
-                var stats = _serverStats;
-                if (stats == null) continue;
-
-                bool inCombat = (Time.time - _lastDamageTime) < REGEN_COMBAT_SUPPRESSION;
-                if (inCombat) continue;
-
-                float hpRestored = 0f;
-                float mpRestored = 0f;
-
-                if (CurrentHP < MaxHP && stats.HPRegen > 0f)
-                {
-                    float before = CurrentHP;
-                    CurrentHP    = Mathf.Min(MaxHP, CurrentHP + stats.HPRegen);
-                    hpRestored   = CurrentHP - before;
-                    if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-                }
-
-                if (CurrentMP < MaxMP && stats.MPRegen > 0f)
-                {
-                    float before = CurrentMP;
-                    CurrentMP    = Mathf.Min(MaxMP, CurrentMP + stats.MPRegen);
-                    mpRestored   = CurrentMP - before;
-                    if (_serverCharData != null) _serverCharData.CurrentMP = CurrentMP;
-                }
-
-                if (hpRestored >= REGEN_DISPLAY_THRESHOLD || mpRestored >= REGEN_DISPLAY_THRESHOLD)
-                    RpcShowRegenTick(hpRestored, mpRestored);
-            }
+            RpcShowRegenTick(hpRestored, mpRestored);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -515,11 +450,7 @@ namespace RPG.Network
         public void CmdSetMoving(bool moving)
         {
             if (connectionToClient == null) return;
-
-            // Validação básica: se o player diz que está parado mas o agent ainda tem velocidade alta, 
-            // ou se diz que está movendo mas está morto.
             if (Dead && moving) return;
-
             IsMoving = moving;
         }
 
@@ -620,7 +551,7 @@ namespace RPG.Network
 
             if (!ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
             {
-                if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime))
+                if (_cooldowns != null && _cooldowns.TryGetSkillEndTime(skillIndex, out float endTime))
                     RpcSkillRejected(skillIndex, $"{skill.Name}: aguarde {endTime - Time.time:0.0}s");
                 return;
             }
@@ -635,7 +566,7 @@ namespace RPG.Network
 
             if (skill.Type == Combat.SkillType.Heal)
             {
-                float heal   = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
+                float heal = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
                 heal = SanitizeAmount(heal);
                 float before = CurrentHP;
                 CurrentHP    = Mathf.Min(MaxHP, CurrentHP + heal);
@@ -645,7 +576,6 @@ namespace RPG.Network
                 if (healed > 0f) RpcShowHeal(healed);
             }
 
-            // SINCRONIZA ANIMAÇÃO PARA TODOS
             if (!string.IsNullOrEmpty(skill.AnimTrigger))
                 RpcPlayAnimation(skill.AnimTrigger);
 
@@ -669,7 +599,7 @@ namespace RPG.Network
             dmg = SanitizeAmount(dmg);
             if (dmg <= 0f) return;
 
-            _lastDamageTime = Time.time;
+            _regenLoop?.NotifyDamageTaken();
             CurrentHP = Mathf.Max(0f, CurrentHP - dmg);
             if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
             if (CurrentHP <= 0f) ServerDie();
@@ -682,7 +612,7 @@ namespace RPG.Network
             dmg = SanitizeAmount(dmg);
             if (dmg <= 0f) return;
 
-            _lastDamageTime = Time.time;
+            _regenLoop?.NotifyDamageTaken();
             float before    = CurrentHP;
             CurrentHP       = Mathf.Max(0f, CurrentHP - dmg);
             float actual    = before - CurrentHP;
@@ -729,25 +659,17 @@ namespace RPG.Network
         [Server]
         public bool ServerCheckAndSetCooldown(int skillIndex, float cooldownDuration)
         {
-            if (cooldownDuration <= 0f) return true;
-            cooldownDuration = Mathf.Min(cooldownDuration, GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
-
-            if (_serverSkillCooldowns.TryGetValue(skillIndex, out float endTime) && Time.time < endTime)
-                return false;
-            _serverSkillCooldowns[skillIndex] = Time.time + cooldownDuration;
-            return true;
+            return _cooldowns != null
+                && _cooldowns.TryCheckAndSetSkill(skillIndex, cooldownDuration,
+                    GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
         }
 
         [Server]
         public bool ServerCheckAndSetCooldownLong(long cooldownKey, float cooldownDuration)
         {
-            if (cooldownDuration <= 0f) return true;
-            cooldownDuration = Mathf.Min(cooldownDuration, GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
-
-            if (_serverBasicAttackCooldowns.TryGetValue(cooldownKey, out float endTime) && Time.time < endTime)
-                return false;
-            _serverBasicAttackCooldowns[cooldownKey] = Time.time + cooldownDuration;
-            return true;
+            return _cooldowns != null
+                && _cooldowns.TryCheckAndSetBasicAttack(cooldownKey, cooldownDuration,
+                    GameConstants.Server.MAX_SKILL_COOLDOWN_SECONDS);
         }
 
         [Server]
@@ -772,7 +694,7 @@ namespace RPG.Network
                 CurrentMP = MaxMP;
                 _serverCharData.CurrentHP = MaxHP;
                 _serverCharData.CurrentMP = MaxMP;
-                StartRegenLoop();
+                _regenLoop?.ServerStart();
                 Debug.Log($"[Server] {CharacterName} → Lv {Level}!");
 
                 _questManager?.NotifyLevelUp(Level);
@@ -780,8 +702,11 @@ namespace RPG.Network
 
             DatabaseManager.Instance?.LogEconomy(_serverCharData.CharacterId, "exp_gain", amount);
 
-            if (leveledUp) ServerSaveCharacterForced();
-            else           MarkDirty();
+            // Se subiu de nível ou ganhou muito XP (ex: mais de 10% do necessário para o próximo), salva forçado
+            bool largeExpGain = amount > (ExperienceToNextLevel * 0.1f);
+
+            if (leveledUp || largeExpGain) ServerSaveCharacterForced();
+            else                           MarkDirty();
 
             RpcOnExpGained(amount, leveledUp);
         }
@@ -808,10 +733,6 @@ namespace RPG.Network
         }
 
         [Server] public void ServerSaveCharacter() => ServerSaveCharacterForced();
-
-        // ══════════════════════════════════════════════════════════════════
-        // API pública
-        // ══════════════════════════════════════════════════════════════════
 
         public CharacterRace GetRaceEnum() => _cachedRace;
 
@@ -927,7 +848,6 @@ namespace RPG.Network
         private void RpcOnExpGained(long amount, bool leveledUp)
         {
             if (!isLocalPlayer) return;
-
             if (Dead && !leveledUp) return;
 
             FloatingTextManager.Instance?.Show($"+{amount} XP",
@@ -1004,16 +924,23 @@ namespace RPG.Network
         private void ServerDie()
         {
             CurrentHP = 0f;
-            StopRegenLoop();
+            _regenLoop?.Stop();
             if (_agent != null && _agent.isOnNavMesh) _agent.ResetPath();
 
             IsMoving = false;
 
-            // FIX: limpa AMBOS os dicionários de cooldown ANTES de salvar.
-            // Garante que o personagem não ressuscita com skills bloqueadas
-            // e que o save não persiste cooldowns stale.
-            _serverBasicAttackCooldowns.Clear();
-            _serverSkillCooldowns.Clear();
+            // --- Penalidade de Morte ---
+            if (_serverCharData != null && Level > 1)
+            {
+                long penalty = (long)(ExperienceToNextLevel * 0.05f); // 5% do XP do level atual
+                _serverCharData.RemoveExperience(penalty);
+                Experience = _serverCharData.Experience;
+                MarkDirty();
+                RpcShowMessageToOwner($"Você morreu e perdeu {penalty} XP.");
+            }
+
+            // Limpa cooldowns para evitar bloqueios após respawn
+            _cooldowns?.ServerClearAll();
 
             ServerSaveCharacterForced();
             RpcPlayerDied();
@@ -1040,10 +967,10 @@ namespace RPG.Network
                 ServerSaveCharacterForced();
             }
 
-            _lastDamageTime = -999f;
+            _regenLoop?.ResetCombatSuppression();
 
             ConfigureServerAgent();
-            StartRegenLoop();
+            _regenLoop?.ServerStart();
 
             RpcOnRespawned(pos, CurrentHP, MaxHP, CurrentMP, MaxMP);
         }
@@ -1149,14 +1076,6 @@ namespace RPG.Network
             AttributeWindowUI.Instance?.RefreshXPBar(Experience, ExperienceToNextLevel);
         }
 
-        /// <summary>
-        /// FIX: todos os hooks de AllocXxx convergem para um único método que
-        /// marca _allocDirty. O Update processa a dirty flag uma vez por frame,
-        /// evitando múltiplos FullRefresh quando vários SyncVars chegam juntos.
-        /// Antes, cada hook individual marcava _allocDirty separadamente com
-        /// nomes distintos (OnAllocSTRChanged etc) — funcionalmente idêntico,
-        /// mas mais verboso e propenso a inconsistência.
-        /// </summary>
         private void OnAllocChanged(int _, int __)
         {
             if (isLocalPlayer) _allocDirty = true;
@@ -1192,29 +1111,19 @@ namespace RPG.Network
         private void ApplyEquipmentDataToEntity()
         {
             if (_playerEntity?.Data == null || _inventory == null) return;
-
             _playerEntity.Data.EquipmentBonuses = _inventory.BuildEquipmentBonuses();
-
             if (_playerEntity.IsInitialized)
                 _playerEntity.FullRefreshStatsFromData();
         }
 
-        /// <summary>
-        /// FIX: OnStatsVersionChanged agora é o único ponto de FullRefresh no cliente.
-        /// Os hooks de AllocXxx apenas marcam _allocDirty (Update consolida).
-        /// Isso evita redundância — antes tanto os hooks de AllocXxx quanto
-        /// OnStatsVersionChanged podiam disparar FullRefreshStatsFromData no mesmo frame.
-        /// </summary>
         private void OnStatsVersionChanged(int _, int __)
         {
             if (!isLocalPlayer) return;
             if (_playerEntity == null || !_playerEntity.IsInitialized) return;
 
-            // Aplica equipamento mais recente e recalcula stats
             if (_inventory != null)
                 _playerEntity.Data.EquipmentBonuses = _inventory.BuildEquipmentBonuses();
 
-            // Aplica atributos alocados mais recentes
             if (_playerEntity.Data != null)
             {
                 _playerEntity.Data.BaseAttributes.STR = BaseSTR;
@@ -1232,7 +1141,6 @@ namespace RPG.Network
                 _playerEntity.Data.AllocatedLUK = AllocatedLUK;
             }
 
-            // Cancela as dirty flags pois acabamos de processar tudo
             _allocDirty = false;
             _equipDirty = false;
 

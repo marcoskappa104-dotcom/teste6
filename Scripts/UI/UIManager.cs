@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
+using System.Collections;
 using RPG.Character;
 using RPG.Combat;
 
@@ -36,9 +37,20 @@ namespace RPG.UI
         [SerializeField] private Slider   expBar;
         [SerializeField] private TMP_Text expText;
 
+        [Header("Feedback")]
+        [SerializeField] private Image damageFlashImage;
+        [SerializeField] private float flashDuration = 0.2f;
+        [SerializeField] private Color flashColor    = new Color(1f, 0f, 0f, 0.4f);
+
         [Header("Attribute Window")]
         [SerializeField] private AttributeWindowUI attributeWindow;
         [SerializeField] private Button            attributeWindowButton;
+
+        [Header("Chat")]
+        [SerializeField] private ChatUI chatUI;
+
+        [Header("Party")]
+        [SerializeField] private PartyUI partyUI;
 
         [Header("Atalhos de UI (opcional)")]
         [SerializeField] private Button inventoryHudButton;
@@ -56,6 +68,8 @@ namespace RPG.UI
         private bool _hudButtonsRegistered      = false;
         private bool _attributeButtonRegistered = false;
 
+        private Coroutine _flashCoroutine;
+
         private void Awake()
         {
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
@@ -66,6 +80,12 @@ namespace RPG.UI
         {
             ClearTargetPanel();
             if (messageText != null) messageText.text = "";
+
+            if (damageFlashImage != null)
+            {
+                damageFlashImage.color = new Color(flashColor.r, flashColor.g, flashColor.b, 0f);
+                damageFlashImage.gameObject.SetActive(false);
+            }
 
             if (attributeWindowButton != null && !_attributeButtonRegistered)
             {
@@ -212,6 +232,7 @@ namespace RPG.UI
             _player.OnMPChanged    += UpdateMP;
             _player.OnStatsChanged += OnStatsChangedHandler;
             _player.OnInitialized  += OnPlayerInitialized;
+            _player.OnHPChanged    += OnPlayerDamageFeedback;
 
             if (_skills != null)
             {
@@ -242,6 +263,7 @@ namespace RPG.UI
             _player.OnMPChanged    -= UpdateMP;
             _player.OnStatsChanged -= OnStatsChangedHandler;
             _player.OnInitialized  -= OnPlayerInitialized;
+            _player.OnHPChanged    -= OnPlayerDamageFeedback;
         }
 
         private void UnsubscribeFromSkills()
@@ -374,6 +396,41 @@ namespace RPG.UI
             if (messageText == null) return;
             messageText.text = msg;
             _messageTimer    = messageDisplayTime;
+        }
+
+        // ── Feedback Visual (Damage Flash) ────────────────────────
+
+        private float _lastHP;
+
+        private void OnPlayerDamageFeedback(float current, float max)
+        {
+            if (current < _lastHP && current > 0)
+            {
+                TriggerDamageFlash();
+            }
+            _lastHP = current;
+        }
+
+        public void TriggerDamageFlash()
+        {
+            if (damageFlashImage == null) return;
+            if (_flashCoroutine != null) StopCoroutine(_flashCoroutine);
+            _flashCoroutine = StartCoroutine(DamageFlashRoutine());
+        }
+
+        private IEnumerator DamageFlashRoutine()
+        {
+            damageFlashImage.gameObject.SetActive(true);
+            float elapsed = 0f;
+            while (elapsed < flashDuration)
+            {
+                elapsed += Time.deltaTime;
+                float alpha = Mathf.Lerp(flashColor.a, 0f, elapsed / flashDuration);
+                damageFlashImage.color = new Color(flashColor.r, flashColor.g, flashColor.b, alpha);
+                yield return null;
+            }
+            damageFlashImage.gameObject.SetActive(false);
+            _flashCoroutine = null;
         }
     }
 }

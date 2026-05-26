@@ -6,7 +6,7 @@ using System.Threading;
 using RPG.Data;
 using RPG.Quest;
 
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
 using SQLite;
 #endif
 
@@ -16,7 +16,7 @@ namespace RPG.Managers
     // Tabelas SQLite
     // ══════════════════════════════════════════════════════════════════════
 
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
     [Table("accounts")]
     public class AccountRow
     {
@@ -163,7 +163,7 @@ namespace RPG.Managers
 
         private const int EXPECTED_HASH_LENGTH = 64;
 
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
         private SQLiteConnection                 _db;
         private readonly object                  _dbLock              = new object();
         private volatile bool                    _closed              = false;
@@ -183,7 +183,7 @@ namespace RPG.Managers
             Instance = this;
             DontDestroyOnLoad(gameObject);
 
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
             InitializeDatabase();
             StartWriteThread();
 #else
@@ -196,7 +196,7 @@ namespace RPG.Managers
 
         private void FlushAndClose()
         {
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
             if (_closed) return;
             if (_shuttingDown) return;
 
@@ -219,7 +219,21 @@ namespace RPG.Managers
 
             _closed = true;
 
-            lock (_dbLock) { _db?.Close(); _db = null; }
+            lock (_dbLock)
+            {
+                if (_db != null)
+                {
+                    try
+                    {
+                        // Força um checkpoint do WAL para garantir que tudo vá para o .db principal
+                        _db.Execute("PRAGMA wal_checkpoint(FULL);");
+                    }
+                    catch (Exception e) { Debug.LogWarning($"[DB] Checkpoint falhou no shutdown: {e.Message}"); }
+
+                    _db.Close();
+                    _db = null;
+                }
+            }
             Debug.Log("[DatabaseManager] Banco fechado.");
 #endif
         }
@@ -230,7 +244,7 @@ namespace RPG.Managers
                 return _delayRng.Next(LOGIN_FAIL_DELAY_MIN_MS, LOGIN_FAIL_DELAY_MAX_MS + 1);
         }
 
-#if UNITY_SERVER
+#if UNITY_SERVER || UNITY_EDITOR
 
         // ── Inicialização ──────────────────────────────────────────────────
 

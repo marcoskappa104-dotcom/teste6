@@ -174,11 +174,11 @@ namespace RPG.Data
 
         public Color RarityColor => Rarity switch
         {
-            ItemRarity.Common    => new Color(0.8f, 0.8f, 0.8f),
-            ItemRarity.Uncommon  => new Color(0.3f, 0.8f, 0.3f),
-            ItemRarity.Rare      => new Color(0.2f, 0.5f, 1.0f),
-            ItemRarity.Epic      => new Color(0.7f, 0.2f, 0.9f),
-            ItemRarity.Legendary => new Color(1.0f, 0.6f, 0.1f),
+            ItemRarity.Common    => Color.white,
+            ItemRarity.Uncommon  => new Color(0.12f, 1f, 0f),      // Verde
+            ItemRarity.Rare      => new Color(0f, 0.44f, 1f),      // Azul
+            ItemRarity.Epic      => new Color(0.64f, 0.21f, 0.93f), // Roxo
+            ItemRarity.Legendary => new Color(1f, 0.5f, 0f),       // Laranja
             _                    => Color.white
         };
 

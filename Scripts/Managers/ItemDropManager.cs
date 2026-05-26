@@ -35,6 +35,27 @@ namespace RPG.Managers
         }
 
         /// <summary>
+        /// Sorteia drops usando a nova estrutura de LootTable.
+        /// </summary>
+        [Server]
+        public void ServerSpawnFromTable(Vector3 originPosition, LootTable table)
+        {
+            if (table == null) return;
+            var drops = table.GetDrops();
+            if (drops == null || drops.Count == 0) return;
+
+            Vector3 landPosition = GetLandPosition(originPosition);
+            int dropIndex = 0;
+
+            foreach (var drop in drops)
+            {
+                if (dropIndex >= MAX_DROPS_PER_SPAWN) break;
+                Vector3 pos = ScatterPosition(landPosition, dropIndex++);
+                SpawnWorldItem(pos, drop.itemId, originPosition, drop.quantity);
+            }
+        }
+
+        /// <summary>
         /// Sorteia drops para um monstro morto.
         /// guaranteedDrops são sempre spawnados (independente de chance).
         /// </summary>
@@ -52,18 +73,7 @@ namespace RPG.Managers
                 return;
             }
 
-            // Tenta encontrar o chão a partir da posição de origem
-            Vector3 landPosition = originPosition;
-            if (Physics.Raycast(originPosition + Vector3.up, Vector3.down, out RaycastHit hit, 5f))
-            {
-                // Só aceita o hit se ele não for absurdamente longe da origem (0,0,0) 
-                // caso o originPosition seja válido.
-                if (hit.point.sqrMagnitude > 0.001f || originPosition.sqrMagnitude < 0.001f)
-                {
-                    landPosition = hit.point;
-                }
-            }
-
+            Vector3 landPosition = GetLandPosition(originPosition);
             int dropIndex = 0;
 
             // 1. Drops garantidos (com cap defensivo)
@@ -73,7 +83,7 @@ namespace RPG.Managers
                 for (int i = 0; i < limit; i++)
                 {
                     Vector3 pos = ScatterPosition(landPosition, dropIndex++);
-                    SpawnWorldItem(pos, guaranteedDrops[i], originPosition);
+                    SpawnWorldItem(pos, guaranteedDrops[i], originPosition, 1);
                 }
             }
 
@@ -90,17 +100,30 @@ namespace RPG.Managers
                     if (roll <= entry.DropChance)
                     {
                         Vector3 pos = ScatterPosition(landPosition, dropIndex++);
-                        SpawnWorldItem(pos, entry.Item.ItemId, originPosition);
+                        SpawnWorldItem(pos, entry.Item.ItemId, originPosition, 1);
                     }
                 }
             }
+        }
+
+        private Vector3 GetLandPosition(Vector3 origin)
+        {
+            Vector3 landPosition = origin;
+            if (Physics.Raycast(origin + Vector3.up, Vector3.down, out RaycastHit hit, 5f))
+            {
+                if (hit.point.sqrMagnitude > 0.001f || origin.sqrMagnitude < 0.001f)
+                {
+                    landPosition = hit.point;
+                }
+            }
+            return landPosition;
         }
 
         /// <summary>
         /// Valida o item ANTES de instanciar para evitar memory leak.
         /// </summary>
         [Server]
-        private void SpawnWorldItem(Vector3 targetPosition, string itemId, Vector3 origin)
+        private void SpawnWorldItem(Vector3 targetPosition, string itemId, Vector3 origin, int quantity)
         {
             if (string.IsNullOrEmpty(itemId)) return;
 
@@ -121,13 +144,12 @@ namespace RPG.Managers
 
             if (item == null)
             {
-                // Não deveria acontecer (validamos em Awake), mas defesa em profundidade
                 Debug.LogError("[ItemDropManager] worldItemPrefab não tem WorldItem component.");
                 Destroy(go);
                 return;
             }
 
-            item.ServerInitialize(itemId, origin, targetPosition);
+            item.ServerInitialize(itemId, origin, targetPosition, quantity);
             NetworkServer.Spawn(go);
         }
 

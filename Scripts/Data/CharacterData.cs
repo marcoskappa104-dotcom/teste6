@@ -126,6 +126,15 @@ namespace RPG.Data
         }
 
         /// <summary>
+        /// Remove experiência (penalidade de morte). Não reduz o level.
+        /// </summary>
+        public void RemoveExperience(long amount)
+        {
+            if (amount <= 0) return;
+            Experience = Math.Max(0, Experience - amount);
+        }
+
+        /// <summary>
         /// Cria uma cópia profunda deste CharacterData.
         /// FIX: usa o setter de Level (não o campo privado _level) para garantir
         /// que o cache sujo seja marcado corretamente no clone.

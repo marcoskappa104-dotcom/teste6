@@ -6,29 +6,40 @@ using Mirror;
 using RPG.Data;
 using RPG.UI;
 using RPG.Character;
-using RPG.Combat;
 
 namespace RPG.Network
 {
     public enum MonsterDisposition { Passive, Neutral, Aggressive }
 
-
+    /// <summary>
+    /// Entidade de monstro — agora é principalmente orquestrador.
+    ///
+    /// Responsabilidades mantidas:
+    /// - Identidade (nome, level, monsterId)
+    /// - Stats derivados
+    /// - SyncVars de HP / IsDead / IsMoving / SpawnGeneration
+    /// - ITargetable (seleção, healthbar)
+    /// - RPCs visuais (damage floating, miss, anim)
+    ///
+    /// Delegado para componentes irmãos:
+    /// - MonsterAI         → estados de IA
+    /// - MonsterCombat     → Cmds de ataque, damageLog, drops
+    /// - MonsterDeathHandler → sequência de morte server-side
+    /// - MonsterVisualFader  → fade no cliente
+    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NetworkIdentity))]
+    [RequireComponent(typeof(MonsterAI))]
+    [RequireComponent(typeof(MonsterCombat))]
+    [RequireComponent(typeof(MonsterDeathHandler))]
     public class NetworkMonsterEntity : NetworkBehaviour, ITargetable
     {
-        // ── Configuração via Inspector ─────────────────────────────────────
         [Header("Identidade")]
         [SerializeField] private string monsterDisplayName = "Monstro";
         [SerializeField] private int    level              = 1;
 
-        [Tooltip("ID único para quests do tipo KillMonster (ex: 'wolf_brown'). " +
-                 "Pode ser compartilhado entre prefabs (todos os 'wolf_brown' " +
-                 "contam para a mesma quest). Vazio = não conta para quests.")]
+        [Tooltip("ID único para quests do tipo KillMonster.")]
         [SerializeField] private string monsterId = "";
-
-        [Header("Comportamento")]
-        [SerializeField] private MonsterDisposition disposition = MonsterDisposition.Aggressive;
 
         [Header("Atributos Base (Lv1) — escalam com o nível")]
         [SerializeField] private int baseSTR = 12;
@@ -38,58 +49,17 @@ namespace RPG.Network
         [SerializeField] private int baseINT = 5;
         [SerializeField] private int baseLUK = 5;
 
-        [Header("Ranges de IA")]
-        [SerializeField] private float aggroRange  = 10f;
-        [SerializeField] private float attackRange = 2.5f;
-        [SerializeField] private float leashRange  = 30f;
-
-        [Header("Kite")]
-        [SerializeField] private float kiteDistanceFraction = 0.50f;
-
-        [Header("Performance de IA")]
-        [SerializeField] private float aggroScanInterval = 0.5f;
-        [SerializeField] private float pathUpdateRate    = 0.15f;
-
-        [Header("Patrulha")]
-        [SerializeField] private bool        usePatrolPoints = false;
-        [SerializeField] private Transform[] patrolPoints;
-        [SerializeField] private float       patrolWaitTime  = 2f;
-        [SerializeField] private float       patrolRadius    = 12f;
-
-        [Header("Fuga (apenas Passive)")]
-        [SerializeField] private float fleeDuration  = 6f;
-        [SerializeField] private float fleeSpeedMult = 1.3f;
-
-        [Header("Morte e Respawn")]
-        [SerializeField] private float bodyFadeDelay    = 5f;
-        [SerializeField] private float bodyFadeDuration = 1f;
-        [SerializeField] private float respawnDelay     = 15f;
-
-        [Header("Recompensa")]
-        [SerializeField] private long expReward = 50;
-
-        [SerializeField] private List<LootEntry> dropTable         = new List<LootEntry>();
-        [SerializeField] private List<string>   guaranteedDropIds = new List<string>();
-
         [Header("Visuals")]
         [SerializeField] private GameObject         selectionIndicator;
         [SerializeField] private MonsterHealthBarUI healthBarUI;
         [SerializeField] private GameObject         visualRoot;
 
-        [Header("Projétil de impacto (ponto de spawn)")]
+        [Header("Projétil — ponto de impacto")]
         [Tooltip("Onde projéteis miram (centro de massa do monstro).")]
         [SerializeField] private Transform projectileImpactPoint;
 
-        // ── Constantes server-side ─────────────────────────────────────────
-        private const float ATTACK_RANGE_TOLERANCE         = 1.15f;
-        private const float CHASE_DEST_FRACTION            = 0.82f;
-        private const float SERVER_MAX_PLAYER_ATTACK_RANGE = 30f;
-        private const float REGEN_INTERVAL                 = 5f;
-        private const float REGEN_PERCENT                  = 0.05f;
-        private const float MOVING_UPDATE_INTERVAL         = 0.1f;
-        private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f;
-        private const int   AGGRO_OVERLAP_BUFFER_SIZE      = 32;
-        private const int   MAX_DAMAGE_LOG_ENTRIES         = 64;
+        // ── Constantes ─────────────────────────────────────────────────────
+        private const float MOVING_UPDATE_INTERVAL = 0.1f;
 
         // ── SyncVars ───────────────────────────────────────────────────────
         [SyncVar(hook = nameof(OnCurrentHPChanged))] private float _currentHP;
@@ -99,10 +69,12 @@ namespace RPG.Network
         [SyncVar] private int _spawnGeneration = 0;
 
         public int SpawnGeneration => _spawnGeneration;
+        public bool DeathProcessed { get; private set; }
 
         // ── ITargetable ────────────────────────────────────────────────────
         public string  MonsterId   => monsterId;
         public string  DisplayName => monsterDisplayName;
+        public int     Level       => level;
         public float   CurrentHP   => _currentHP;
         public float   MaxHP       => _maxHP;
         public bool    IsDead      => _isDead;
@@ -112,66 +84,55 @@ namespace RPG.Network
             ? projectileImpactPoint.position
             : transform.position + Vector3.up * 1f;
 
+        public DerivedStats Stats { get; private set; }
+
         public void OnSelected()   { if (selectionIndicator) selectionIndicator.SetActive(true);  }
         public void OnDeselected() { if (selectionIndicator) selectionIndicator.SetActive(false); }
 
-        // ── Estado interno ─────────────────────────────────────────────────
-        private DerivedStats _stats;
-        private readonly Dictionary<uint, float> _damageLog = new();
-        private readonly List<uint> _damageLogCleanupBuffer = new(8);
+        // ── Componentes ────────────────────────────────────────────────────
+        private NavMeshAgent         _agent;
+        private Animator             _animator;
+        private MonsterAI            _ai;
+        private MonsterCombat        _combat;
+        private MonsterDeathHandler  _deathHandler;
+        private MonsterVisualFader   _fader;
 
-        private float _kiteDistance;
-
-        private enum AIState { Idle, Patrol, Chase, Combat, Flee, ReturnHome, Dead }
-        private AIState       _state = AIState.Idle;
-        private NavMeshAgent  _agent;
-        private Animator      _animator;
-        private NetworkPlayer _aggroTarget;
-        private bool          _wasAttacked;
-
-        private float _attackAccumulator;
-        private float _fleeTimer;
-        private int   _patrolIndex;
-        private bool  _patrolWaiting;
-        private bool  _patrolTargetSet;
-        private Vector3 _homePosition;
-        private float   _patrolRadiusRuntime;
+        // ── Estado ─────────────────────────────────────────────────────────
         private bool    _serverResetDone;
-        private NetworkMonsterSpawner _spawner;
+        private float   _lastIsMovingUpdateTime;
+
         private GameObject            _monsterPrefab;
+        private NetworkMonsterSpawner _spawner;
+        private Vector3               _homePosition;
+        private float                 _patrolRadius;
 
-        private int            _targetableLayerMask;
-        private WaitForSeconds _aggroScanWait;
-        private WaitForSeconds _pathUpdateWait;
-        private WaitForSeconds _regenWait;
-        private WaitForSeconds _damageLogCleanupWait;
-
-        private Collider[] _aggroOverlapBuffer;
-
-        private float _lastIsMovingUpdateTime;
-
-        private Coroutine _aggroScanCoroutine;
-        private Coroutine _pathUpdateCoroutine;
-        private Coroutine _patrolWaitCoroutine;
-        private Coroutine _regenCoroutine;
-        private Coroutine _deathSequenceCoroutine;
-        private Coroutine _damageLogCleanupCoroutine;
-
-        private bool _deathProcessed;
-
-        private Coroutine      _clientFadeCoroutine;
-        private List<Material> _fadeMaterialInstances;
-
-        private bool _hasMonsterId;
+        // --- Hit Flash ---
+        private List<Renderer> _renderers;
+        private Coroutine      _hitFlashCoroutine;
+        private readonly Color _hitColor = new Color(1f, 1f, 1f, 1f);
 
         // ══════════════════════════════════════════════════════════════════
-        // Awake / Setup
+        // Awake / lifecycle
         // ══════════════════════════════════════════════════════════════════
 
         private void Awake()
         {
-            _agent    = GetComponent<NavMeshAgent>();
-            _animator = GetComponentInChildren<Animator>();
+            _agent        = GetComponent<NavMeshAgent>();
+            _animator     = GetComponentInChildren<Animator>();
+            _ai           = GetComponent<MonsterAI>();
+            _combat       = GetComponent<MonsterCombat>();
+            _deathHandler = GetComponent<MonsterDeathHandler>();
+            _fader        = GetComponent<MonsterVisualFader>();
+
+            // Cache de renderers para o Hit Flash
+            if (visualRoot != null)
+            {
+                _renderers = new List<Renderer>(visualRoot.GetComponentsInChildren<Renderer>());
+            }
+            else
+            {
+                _renderers = new List<Renderer>(GetComponentsInChildren<Renderer>());
+            }
 
             baseSTR = Mathf.Max(1, baseSTR);
             baseAGI = Mathf.Max(1, baseAGI);
@@ -181,73 +142,44 @@ namespace RPG.Network
             baseLUK = Mathf.Max(1, baseLUK);
             level   = Mathf.Max(1, level);
 
-            _stats = StatsCalculator.CalculateForMonster(
+            Stats = StatsCalculator.CalculateForMonster(
                 new BaseAttributes { STR = baseSTR, AGI = baseAGI, VIT = baseVIT,
                                      DEX = baseDEX, INT = baseINT, LUK = baseLUK },
                 level);
 
-            _homePosition        = transform.position;
-            _patrolRadiusRuntime = patrolRadius;
-            _kiteDistance        = attackRange * kiteDistanceFraction;
-
-            _hasMonsterId = !string.IsNullOrEmpty(monsterId);
-
-            int layer = LayerMask.NameToLayer("Targetable");
-            _targetableLayerMask = layer >= 0 ? (1 << layer) : 0;
-
-            if (_targetableLayerMask == 0)
-                Debug.LogWarning("[NetworkMonsterEntity] Layer 'Targetable' não encontrado.");
-
-            _aggroScanWait        = new WaitForSeconds(aggroScanInterval);
-            _pathUpdateWait       = new WaitForSeconds(pathUpdateRate);
-            _regenWait            = new WaitForSeconds(REGEN_INTERVAL);
-            _damageLogCleanupWait = new WaitForSeconds(DAMAGE_LOG_CLEANUP_INTERVAL);
-            _aggroOverlapBuffer   = new Collider[AGGRO_OVERLAP_BUFFER_SIZE];
+            _homePosition = transform.position;
+            _patrolRadius = 0f;
         }
 
         public override void OnStartClient()
         {
-            // Desativa NavMeshAgent no cliente para evitar erros de NavMesh (só o servidor move)
             if (_agent != null) _agent.enabled = false;
 
             if (selectionIndicator) selectionIndicator.SetActive(false);
             healthBarUI?.UpdateBar(_currentHP, _maxHP);
             if (visualRoot) visualRoot.SetActive(true);
-            RestoreVisualsAlpha();
-        }
 
-        private void OnDisable()
-        {
-            if (_clientFadeCoroutine != null)
-            {
-                StopCoroutine(_clientFadeCoroutine);
-                _clientFadeCoroutine = null;
-            }
-            ReleaseFadeMaterials();
+            _fader?.OnStartClientReset();
         }
 
         [Server]
-        public void SetupMonster(NetworkMonsterSpawner spawner, Vector3 homePos, float newPatrolRadius, GameObject prefab = null)
+        public void SetupMonster(NetworkMonsterSpawner spawner, Vector3 homePos,
+                                 float patrolRadius, GameObject prefab = null)
         {
-            _spawner             = spawner;
-            _homePosition        = homePos;
-            _patrolRadiusRuntime = Mathf.Max(0f, newPatrolRadius);
-            transform.position   = homePos;
-            _patrolTargetSet     = false;
-            
-            if (prefab != null)
-            {
-                _monsterPrefab = prefab;
-            }
-            // Tenta encontrar o prefab original via NetworkIdentity se não foi passado
+            _spawner            = spawner;
+            _homePosition       = homePos;
+            _patrolRadius       = Mathf.Max(0f, patrolRadius);
+            transform.position  = homePos;
+
+            if (prefab != null) _monsterPrefab = prefab;
             else if (_monsterPrefab == null)
             {
                 var ni = GetComponent<NetworkIdentity>();
-                if (ni != null && NetworkClient.prefabs.TryGetValue(ni.assetId, out GameObject registeredPrefab))
-                {
-                    _monsterPrefab = registeredPrefab;
-                }
+                if (ni != null && NetworkClient.prefabs.TryGetValue(ni.assetId, out GameObject registered))
+                    _monsterPrefab = registered;
             }
+
+            _deathHandler?.ConfigureRespawn(_spawner, _monsterPrefab, _homePosition, _patrolRadius);
 
             StartCoroutine(ServerResetNextFrame());
         }
@@ -262,45 +194,29 @@ namespace RPG.Network
         [Server]
         private void ServerReset()
         {
-            _serverResetDone   = true;
-            _maxHP             = _stats.MaxHP;
-            _currentHP         = _maxHP;
-            _isDead            = false;
-            _isMoving          = false;
-            _deathProcessed    = false;
-            _wasAttacked       = false;
-            _state             = AIState.Patrol;
-            _aggroTarget       = null;
-            _attackAccumulator = 0f;
-            _fleeTimer         = 0f;
-            _patrolIndex       = 0;
-            _patrolWaiting     = false;
-            _patrolTargetSet   = false;
-            _damageLog.Clear();
+            _serverResetDone = true;
+            _maxHP           = Stats.MaxHP;
+            _currentHP       = _maxHP;
+            _isDead          = false;
+            _isMoving        = false;
+            DeathProcessed   = false;
 
             _spawnGeneration++;
 
-            _kiteDistance = attackRange * kiteDistanceFraction;
-
-            // REATIVA COLLIDER
+            // Reativa colliders/layer/network transform
             Collider col = GetComponent<Collider>();
-            if (col != null)
-                col.enabled = true;
+            if (col != null) col.enabled = true;
 
-            // RESTAURA LAYER "Targetable"
             int targetableLayer = LayerMask.NameToLayer("Targetable");
             if (targetableLayer >= 0) gameObject.layer = targetableLayer;
 
-            // REATIVA NETWORK TRANSFORM
             var nt = GetComponent<NetworkTransformUnreliable>();
-            if (nt != null)
-                nt.enabled = true;
+            if (nt != null) nt.enabled = true;
 
             if (_agent != null)
             {
-                // Garante que o agente está ativo no servidor
                 _agent.enabled          = true;
-                _agent.speed            = _stats.MoveSpeed;
+                _agent.speed            = Stats.MoveSpeed;
                 _agent.angularSpeed     = 360f;
                 _agent.acceleration     = 12f;
                 _agent.stoppingDistance = 0.5f;
@@ -309,29 +225,17 @@ namespace RPG.Network
                 if (_agent.isOnNavMesh) _agent.Warp(_homePosition);
                 else                    transform.position = _homePosition;
             }
-            else { transform.position = _homePosition; }
+            else
+            {
+                transform.position = _homePosition;
+            }
 
-            CancelAllAICoroutines();
-
-            _aggroScanCoroutine        = StartCoroutine(AggroScanLoop());
-            _pathUpdateCoroutine       = StartCoroutine(PathUpdateLoop());
-            _damageLogCleanupCoroutine = StartCoroutine(DamageLogCleanupLoop());
-            // RpcOnRespawned será chamado pelo ServerDeathSequence após o NetworkServer.Spawn
-        }
-
-        [Server]
-        private void CancelAllAICoroutines()
-        {
-            if (_aggroScanCoroutine        != null) { StopCoroutine(_aggroScanCoroutine);        _aggroScanCoroutine        = null; }
-            if (_pathUpdateCoroutine       != null) { StopCoroutine(_pathUpdateCoroutine);       _pathUpdateCoroutine       = null; }
-            if (_patrolWaitCoroutine       != null) { StopCoroutine(_patrolWaitCoroutine);       _patrolWaitCoroutine       = null; }
-            if (_regenCoroutine            != null) { StopCoroutine(_regenCoroutine);            _regenCoroutine            = null; }
-            if (_deathSequenceCoroutine    != null) { StopCoroutine(_deathSequenceCoroutine);    _deathSequenceCoroutine    = null; }
-            if (_damageLogCleanupCoroutine != null) { StopCoroutine(_damageLogCleanupCoroutine); _damageLogCleanupCoroutine = null; }
+            _ai?.ServerSetupAndStart(_homePosition, _patrolRadius);
+            _combat?.ServerSetup();
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Update
+        // Update — apenas orquestração
         // ══════════════════════════════════════════════════════════════════
 
         private void Update()
@@ -339,9 +243,6 @@ namespace RPG.Network
             if (!isServer) return;
             if (!_serverResetDone) { ServerReset(); return; }
             if (_isDead) return;
-
-            float deltaTime = Time.deltaTime;
-            _attackAccumulator += deltaTime;
 
             // Sincroniza estado de movimento com frequência reduzida
             if (Time.time - _lastIsMovingUpdateTime >= MOVING_UPDATE_INTERVAL)
@@ -351,979 +252,72 @@ namespace RPG.Network
                 if (moving != _isMoving) _isMoving = moving;
             }
 
-            // Otimização: processa a lógica de IA baseada no estado
-            // Estados como Chase e Combat exigem precisão, outros podem ser mais leves
-            switch (_state)
-            {
-                case AIState.Idle:   break;
-                case AIState.Patrol:
-                    if (usePatrolPoints) ServerPatrolWaypoints();
-                    break;
-                case AIState.Chase:      ServerChaseCheck();      break;
-                case AIState.Combat:     ServerCombat();          break;
-                case AIState.Flee:       ServerFleeCheck();       break;
-                case AIState.ReturnHome: ServerReturnHomeCheck(); break;
-            }
+            _ai?.ServerTick(Time.deltaTime);
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Coroutines de IA
-        // ══════════════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// FIX: AggroScanLoop agora verifica _serverResetDone antes de escanear.
-        /// Antes podia tentar escanear antes que o reset estivesse completo,
-        /// causando comportamento inconsistente no primeiro ciclo de vida.
-        /// </summary>
-        [Server]
-        private IEnumerator AggroScanLoop()
-        {
-            while (true)
-            {
-                if (this == null || !isServer) yield break;
-
-                // FIX: aguarda reset estar completo antes de escanear
-                if (_serverResetDone && !_isDead
-                    && (_state == AIState.Idle || _state == AIState.Patrol))
-                {
-                    if (disposition == MonsterDisposition.Aggressive)
-                        TryAggro();
-                    else if (disposition == MonsterDisposition.Neutral && _wasAttacked)
-                        TryAggro();
-                }
-
-                yield return _aggroScanWait;
-            }
-        }
-
-        [Server]
-        private IEnumerator PathUpdateLoop()
-        {
-            yield return null;
-            while (true)
-            {
-                if (this == null || !isServer) yield break;
-
-                if (!_isDead)
-                {
-                    switch (_state)
-                    {
-                        case AIState.Chase:      UpdateChasePath();      break;
-                        case AIState.ReturnHome: UpdateReturnHomePath(); break;
-                        case AIState.Flee:       UpdateFleePath();       break;
-                        case AIState.Patrol:
-                            if (!usePatrolPoints && _patrolRadiusRuntime > 0.1f)
-                                UpdatePatrolAreaPath();
-                            break;
-                    }
-                }
-                yield return _pathUpdateWait;
-            }
-        }
-
-        [Server]
-        private IEnumerator PatrolWaitCoroutine()
-        {
-            _patrolWaiting = true;
-            yield return new WaitForSeconds(patrolWaitTime);
-            _patrolWaiting       = false;
-            _patrolTargetSet     = false;
-            _patrolWaitCoroutine = null;
-        }
-
-        [Server]
-        private IEnumerator RegenLoop()
-        {
-            while (_state == AIState.ReturnHome)
-            {
-                yield return _regenWait;
-                if (this == null || !isServer) break;
-                if (_state != AIState.ReturnHome) break;
-                _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * REGEN_PERCENT);
-            }
-            _regenCoroutine = null;
-        }
-
-        [Server]
-        private IEnumerator DamageLogCleanupLoop()
-        {
-            while (true)
-            {
-                yield return _damageLogCleanupWait;
-                if (this == null || !isServer) yield break;
-                if (_isDead) continue;
-                CleanupOrphanedDamageEntries();
-            }
-        }
-
-        /// <summary>
-        /// FIX: limpa entradas do damageLog de jogadores mortos ou muito distantes.
-        /// A versão anterior não limpava jogadores mortos (apenas desconectados/distantes),
-        /// causando acúmulo de entradas em encontros longos com muitas mortes.
-        /// </summary>
-        [Server]
-        private void CleanupOrphanedDamageEntries()
-        {
-            if (_damageLog.Count == 0) return;
-
-            _damageLogCleanupBuffer.Clear();
-            float maxDist = leashRange * 3f;
-
-            foreach (var kv in _damageLog)
-            {
-                bool orphaned = false;
-
-                if (!NetworkServer.spawned.TryGetValue(kv.Key, out var identity) || identity == null)
-                {
-                    orphaned = true;
-                }
-                else
-                {
-                    var np = identity.GetComponent<NetworkPlayer>();
-                    if (np == null)
-                    {
-                        orphaned = true;
-                    }
-                    else if (np.Dead)
-                    {
-                        // FIX: jogadores mortos também são considerados órfãos para limpeza
-                        // periódica. Eles ainda recebem XP ao morrer o monstro se
-                        // contribuíram com dano — mas seus registros podem ser limpos
-                        // depois do DAMAGE_LOG_CLEANUP_INTERVAL para liberar memória.
-                        orphaned = true;
-                    }
-                    else if (Vector3.Distance(np.transform.position, transform.position) > maxDist)
-                    {
-                        orphaned = true;
-                    }
-                }
-
-                if (orphaned)
-                    _damageLogCleanupBuffer.Add(kv.Key);
-            }
-
-            for (int i = 0; i < _damageLogCleanupBuffer.Count; i++)
-                _damageLog.Remove(_damageLogCleanupBuffer[i]);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Estados de IA
-        // ══════════════════════════════════════════════════════════════════
-
-        private void ServerPatrolWaypoints()
-        {
-            if (patrolPoints == null || patrolPoints.Length == 0) return;
-            if (_agent == null || !_agent.isOnNavMesh || _patrolWaiting) return;
-
-            if (!_agent.pathPending && _agent.remainingDistance < 0.5f)
-            {
-                _patrolIndex = (_patrolIndex + 1) % patrolPoints.Length;
-                if (patrolPoints[_patrolIndex] == null) return;
-                _agent.SetDestination(patrolPoints[_patrolIndex].position);
-                _patrolWaiting       = true;
-                _patrolWaitCoroutine = StartCoroutine(PatrolWaitCoroutine());
-            }
-        }
-
-        private void ServerChaseCheck()
-        {
-            if (_aggroTarget == null || _aggroTarget.Dead) { ResetAggro(); return; }
-            if (Vector3.Distance(transform.position, _homePosition) > leashRange)
-            { ResetAggro(); EnterReturnHome(); return; }
-
-            float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
-            if (dist > aggroRange * 2.5f) { ResetAggro(); return; }
-
-            if (dist <= attackRange)
-            {
-                float ai = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-                _attackAccumulator = ai * 0.5f;
-                _state             = AIState.Combat;
-
-                if (_agent != null && _agent.isOnNavMesh)
-                {
-                    _agent.ResetPath();
-                    _agent.stoppingDistance = 0.5f;
-                    _agent.velocity         = Vector3.zero;
-                }
-            }
-        }
-
-        private void ServerCombat()
-        {
-            if (_aggroTarget == null || _aggroTarget.Dead) { ResetAggro(); return; }
-            if (Vector3.Distance(transform.position, _homePosition) > leashRange)
-            { ResetAggro(); EnterReturnHome(); return; }
-
-            float dist = Vector3.Distance(transform.position, _aggroTarget.transform.position);
-
-            if (dist > attackRange * 1.4f) { _state = AIState.Chase; return; }
-
-            if (_agent != null && _agent.isOnNavMesh)
-            {
-                if (dist < _kiteDistance)
-                {
-                    Vector3 away       = (transform.position - _aggroTarget.transform.position).normalized;
-                    Vector3 kiteTarget = transform.position + away * (_kiteDistance + 0.5f);
-                    _agent.stoppingDistance = 0.5f;
-                    _agent.SetDestination(kiteTarget);
-                }
-                else if (_agent.hasPath)
-                {
-                    _agent.ResetPath();
-                    _agent.stoppingDistance = 0.5f;
-                    _agent.velocity         = Vector3.zero;
-                }
-            }
-
-            Vector3 dir = _aggroTarget.transform.position - transform.position;
-            dir.y = 0f;
-            if (dir.sqrMagnitude > 0.01f)
-                transform.rotation = Quaternion.Slerp(
-                    transform.rotation, Quaternion.LookRotation(dir), 8f * Time.deltaTime);
-
-            float aiCombat = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-            if (_attackAccumulator >= aiCombat)
-            {
-                _attackAccumulator -= aiCombat;
-                ServerAttack();
-            }
-        }
-
-        private void ServerFleeCheck()
-        {
-            _fleeTimer += Time.deltaTime;
-            if (_fleeTimer >= fleeDuration || _agent == null || !_agent.isOnNavMesh)
-            {
-                if (_agent != null) _agent.speed = _stats.MoveSpeed;
-                _fleeTimer = 0f;
-                EnterReturnHome();
-            }
-        }
-
-        private void ServerReturnHomeCheck()
-        {
-            if (_agent == null || !_agent.isOnNavMesh) return;
-            if (Vector3.Distance(transform.position, _homePosition) < 1.5f)
-            {
-                _agent.ResetPath();
-                _wasAttacked     = false;
-                _patrolWaiting   = false;
-                _patrolTargetSet = false;
-                _damageLog.Clear();
-                if (_regenCoroutine != null) { StopCoroutine(_regenCoroutine); _regenCoroutine = null; }
-                _state = AIState.Patrol;
-            }
-        }
-
-        [Server]
-        private void UpdateChasePath()
-        {
-            if (_aggroTarget == null || _agent == null || !_agent.isOnNavMesh) return;
-            Vector3 destination = CalculateChaseDestination(_aggroTarget.transform.position);
-            _agent.stoppingDistance = 0.2f;
-            _agent.SetDestination(destination);
-        }
-
-        private Vector3 CalculateChaseDestination(Vector3 playerPos)
-        {
-            Vector3 toPlayer     = playerPos - transform.position;
-            float   dist         = toPlayer.magnitude;
-            float   safeStopDist = attackRange * CHASE_DEST_FRACTION;
-
-            if (dist <= safeStopDist * 0.95f) return transform.position;
-
-            Vector3 direction   = toPlayer.normalized;
-            Vector3 destination = playerPos - direction * safeStopDist;
-
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
-                return hit.position;
-
-            return destination;
-        }
-
-        [Server]
-        private void UpdateReturnHomePath()
-        {
-            if (_agent == null || !_agent.isOnNavMesh) return;
-            _agent.stoppingDistance = 0.5f;
-            _agent.SetDestination(_homePosition);
-        }
-
-        [Server]
-        private void UpdateFleePath()
-        {
-            if (_aggroTarget == null || _agent == null || !_agent.isOnNavMesh) return;
-            Vector3 fleeDir = (transform.position - _aggroTarget.transform.position).normalized;
-            Vector3 fleePos = transform.position + fleeDir * (aggroRange * 1.5f);
-            if (NavMesh.SamplePosition(fleePos, out NavMeshHit hit, 5f, NavMesh.AllAreas))
-                _agent.SetDestination(hit.position);
-        }
-
-        [Server]
-        private void UpdatePatrolAreaPath()
-        {
-            if (_agent == null || !_agent.isOnNavMesh || _patrolWaiting) return;
-            bool arrived = !_agent.pathPending && _agent.remainingDistance < 0.6f;
-
-            if (_patrolTargetSet && arrived)
-            {
-                if (_patrolWaitCoroutine == null)
-                    _patrolWaitCoroutine = StartCoroutine(PatrolWaitCoroutine());
-                return;
-            }
-
-            if (!_patrolTargetSet
-                && TryGetRandomAreaPoint(_homePosition, _patrolRadiusRuntime, out Vector3 dest))
-            {
-                _agent.SetDestination(dest);
-                _patrolTargetSet = true;
-            }
-        }
-
-        [Server]
-        private void TryAggro()
-        {
-            if (_targetableLayerMask == 0) return;
-
-            int count = Physics.OverlapSphereNonAlloc(
-                transform.position, aggroRange, _aggroOverlapBuffer, _targetableLayerMask);
-
-            NetworkPlayer found   = null;
-            float         closest = aggroRange;
-
-            for (int i = 0; i < count; i++)
-            {
-                var col = _aggroOverlapBuffer[i];
-                if (col == null) continue;
-                var np = col.GetComponent<NetworkPlayer>();
-                if (np == null || np.Dead) continue;
-                float d = Vector3.Distance(transform.position, np.transform.position);
-                if (d < closest) { closest = d; found = np; }
-            }
-
-            if (found != null)
-            {
-                _aggroTarget       = found;
-                _state             = AIState.Chase;
-                float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-                _attackAccumulator = ai * 0.3f;
-                CancelPatrolWait();
-            }
-        }
-
-        [Server]
-        private void ResetAggro()
-        {
-            _aggroTarget = null;
-            if (_agent != null && _agent.isOnNavMesh)
-            {
-                _agent.ResetPath();
-                _agent.stoppingDistance = 0.5f;
-                _agent.velocity         = Vector3.zero;
-            }
-            float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-            _attackAccumulator = ai * 0.3f;
-            _patrolTargetSet   = false;
-
-            if (Vector3.Distance(transform.position, _homePosition) > leashRange * 0.5f)
-                EnterReturnHome();
-            else { _patrolWaiting = false; _state = AIState.Patrol; }
-        }
-
-        [Server]
-        private void EnterReturnHome()
-        {
-            _state       = AIState.ReturnHome;
-            _aggroTarget = null;
-            CancelPatrolWait();
-
-            if (_agent != null)
-            {
-                _agent.stoppingDistance = 0.5f;
-                _agent.velocity         = Vector3.zero;
-            }
-
-            if (_regenCoroutine != null) StopCoroutine(_regenCoroutine);
-            _regenCoroutine = StartCoroutine(RegenLoop());
-        }
-
-        private void CancelPatrolWait()
-        {
-            if (_patrolWaitCoroutine != null)
-            {
-                StopCoroutine(_patrolWaitCoroutine);
-                _patrolWaitCoroutine = null;
-            }
-            _patrolWaiting = false;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Ataque do monstro
+        // API server-side usada pelos componentes
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
-        private void ServerAttack()
+        public void ApplyDamageInternal(float dmg)
         {
-            if (_aggroTarget == null || _aggroTarget.Dead) return;
-
-            var targetStats = _aggroTarget.ServerStats;
-
-            bool hit = StatsCalculator.RollHit(_stats.HIT, targetStats?.FLEE ?? 20f);
-            if (!hit)
-            {
-                RpcShowMiss(_aggroTarget.transform.position);
-                return;
-            }
-
-            bool  crit = StatsCalculator.RollCrit(_stats.CRIT);
-            float dmg  = StatsCalculator.CalculatePhysicalDamage(
-                _stats.ATK,
-                targetStats?.DEF ?? 10f,
-                crit,
-                _stats.CritDMG,
-                _stats.Penetration,
-                targetStats?.DamageReduction ?? 0f);
-
-            dmg = SanitizeDamage(dmg);
-
-            if (!_aggroTarget.Dead)
-            {
-                RpcShowDamageTakenOnPlayer(dmg, crit, _aggroTarget.transform.position);
-                _aggroTarget.ServerApplyDamage(dmg);
-            }
-
-            RpcPlayAnim("Attack");
-        }
-
-        [Server]
-        private void ApplyDamageInternal(float dmg)
-        {
-            if (_deathProcessed || _isDead) return;
-
-            dmg = SanitizeDamage(dmg);
+            if (DeathProcessed || _isDead) return;
             if (dmg <= 0f) return;
 
             _currentHP = Mathf.Max(0f, _currentHP - dmg);
+            
+            // Efeito visual de hit (flash)
+            RpcPlayHitEffects();
+
             if (_currentHP <= 0f) ServerDie();
         }
 
-        private static float SanitizeDamage(float dmg)
-        {
-            if (float.IsNaN(dmg) || float.IsInfinity(dmg)) return 1f;
-            return Mathf.Max(0f, dmg);
-        }
-
-        private static NetworkPlayer FindPlayerByNetId(uint netId)
-        {
-            if (NetworkServer.spawned.TryGetValue(netId, out var identity))
-                return identity?.GetComponent<NetworkPlayer>();
-            return null;
-        }
-
         [Server]
-        private void CreditDamageToShooter(uint shooterNetId, float dmg)
+        public void ServerHealPercent(float percent)
         {
-            if (dmg <= 0f) return;
-            if (shooterNetId == 0) return;
-
-            var attacker = FindPlayerByNetId(shooterNetId);
-            if (attacker == null) return;
-
-            if (_damageLog.TryGetValue(shooterNetId, out float existing))
-            {
-                _damageLog[shooterNetId] = existing + dmg;
-                return;
-            }
-
-            if (_damageLog.Count >= MAX_DAMAGE_LOG_ENTRIES)
-            {
-                EvictLowestDamageContributor(dmg, shooterNetId);
-                if (_damageLog.Count >= MAX_DAMAGE_LOG_ENTRIES) return;
-            }
-
-            _damageLog[shooterNetId] = dmg;
+            if (_isDead || DeathProcessed) return;
+            _currentHP = Mathf.Min(_maxHP, _currentHP + _maxHP * percent);
         }
 
-        [Server]
-        private void EvictLowestDamageContributor(float newDamage, uint newShooterNetId)
-        {
-            if (_damageLog.Count == 0) return;
-
-            uint  lowestKey   = 0;
-            float lowestValue = float.MaxValue;
-
-            foreach (var kv in _damageLog)
-            {
-                if (kv.Value < lowestValue)
-                {
-                    lowestValue = kv.Value;
-                    lowestKey   = kv.Key;
-                }
-            }
-
-            if (newDamage > lowestValue && lowestKey != 0)
-                _damageLog.Remove(lowestKey);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Recebimento de dano POR PROJÉTIL
-        // ══════════════════════════════════════════════════════════════════
-
-        [Server]
-        public void ServerTakeProjectileDamage(uint shooterNetId, float dmg, bool crit)
-        {
-            if (_isDead || _deathProcessed) return;
-
-            dmg = SanitizeDamage(dmg);
-            dmg = Mathf.Max(1f, dmg);
-
-            CreditDamageToShooter(shooterNetId, dmg);
-
-            var attacker = FindPlayerByNetId(shooterNetId);
-            if (attacker != null && !attacker.Dead)
-                ApplyAggroReaction(attacker);
-
-            RpcShowDamage(dmg, crit, ImpactPoint);
-            ApplyDamageInternal(dmg);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // CmdRequestSkill
-        // ══════════════════════════════════════════════════════════════════
-
-        [Command(requiresAuthority = false)]
-        public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
-        {
-            if (_isDead || _deathProcessed) return;
-            if (skillIndex < 0 || skillIndex >= NetworkInventory.GEM_SLOT_COUNT) return;
-
-            var attacker = FindPlayerByNetId(attackerNetId);
-            if (attacker == null || attacker.Dead) return;
-
-            if (attacker.connectionToClient == null)
-            {
-                Debug.LogWarning($"[Security] CmdRequestSkill com netId sem conexão: {attackerNetId}");
-                return;
-            }
-
-            var atkStats = attacker.ServerStats;
-            if (atkStats == null) return;
-
-            var inventory = attacker.GetComponent<NetworkInventory>();
-            var skill     = inventory?.GetEquippedSkill(skillIndex);
-            if (skill == null) { attacker.RpcSkillRejected(skillIndex, "Skill inválida."); return; }
-
-            float dist            = Vector3.Distance(attacker.transform.position, transform.position);
-            float maxAllowedRange = skill.Range * ATTACK_RANGE_TOLERANCE;
-            if (dist > maxAllowedRange)
-            {
-                Debug.LogWarning($"[Security] {attacker.CharacterName} usou skill fora de range: " +
-                                 $"dist={dist:0.2f} max={maxAllowedRange:0.2f}");
-                return;
-            }
-
-            if (!attacker.ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
-            {
-                attacker.RpcSkillRejected(skillIndex, $"{skill.Name}: ainda em cooldown.");
-                return;
-            }
-            if (attacker.CurrentMP < skill.ManaCost)
-            {
-                attacker.RpcSkillRejected(skillIndex, "MP insuficiente!");
-                return;
-            }
-
-            attacker.ServerConsumeMP(skill.ManaCost);
-            ServerTakeDamageFromPlayer(attacker, atkStats, isPhysical, skill);
-            attacker.RpcSkillConfirmed(skillIndex, skill.Cooldown);
-
-            // SINCRONIZA ANIMAÇÃO PARA TODOS
-            if (!string.IsNullOrEmpty(skill.AnimTrigger))
-                attacker.RpcPlayAnimation(skill.AnimTrigger);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // CmdBasicAttack
-        // ══════════════════════════════════════════════════════════════════
-
-        [Command(requiresAuthority = false)]
-        public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
-        {
-            if (_isDead || _deathProcessed) return;
-
-            var attacker = FindPlayerByNetId(attackerNetId);
-            if (attacker == null || attacker.Dead) return;
-
-            if (attacker.connectionToClient == null)
-            {
-                Debug.LogWarning($"[Security] CmdBasicAttack com netId sem conexão: {attackerNetId}");
-                return;
-            }
-
-            var atkStats = attacker.ServerStats;
-            if (atkStats == null) return;
-
-            var inventory = attacker.GetComponent<NetworkInventory>();
-            WeaponAttackProfile profile = ResolveServerWeaponProfile(inventory);
-
-            float serverRange    = profile.Range;
-            float effectiveRange = Mathf.Min(
-                Mathf.Clamp(clientAttackRange, 0.5f, SERVER_MAX_PLAYER_ATTACK_RANGE),
-                serverRange);
-
-            float dist            = Vector3.Distance(attacker.transform.position, transform.position);
-            float maxAllowedRange = effectiveRange * ATTACK_RANGE_TOLERANCE;
-
-            if (dist > maxAllowedRange)
-            {
-                Debug.LogWarning($"[Security] {attacker.CharacterName} atacou fora de range: " +
-                                 $"dist={dist:0.2f} max={maxAllowedRange:0.2f} (perfil={profile.Type})");
-                return;
-            }
-
-            long cooldownKey = BuildBasicAttackCooldownKey(attacker.netId, netId);
-            float baseInterval = atkStats.ASPD > 0f ? (1f / atkStats.ASPD) : 1.2f;
-            float attackInterval = Mathf.Clamp(
-                baseInterval * profile.AttackIntervalMultiplier, 0.2f, 3f);
-
-            if (!attacker.ServerCheckAndSetCooldownLong(cooldownKey, attackInterval)) return;
-
-            if (profile.ManaCost > 0f)
-            {
-                if (attacker.CurrentMP < profile.ManaCost)
-                {
-                    attacker.RpcShowMessageToOwner("MP insuficiente para atacar!");
-                    return;
-                }
-                attacker.ServerConsumeMP(profile.ManaCost);
-            }
-
-            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
-            if (!hit)
-            {
-                RpcShowMiss(transform.position);
-                return;
-            }
-
-            bool  crit = StatsCalculator.RollCrit(atkStats.CRIT);
-            float dmg;
-
-            if (profile.IsPhysical)
-            {
-                dmg = StatsCalculator.CalculatePhysicalDamage(
-                    atkStats.ATK * profile.DamageMultiplier,
-                    _stats.DEF,
-                    crit,
-                    atkStats.CritDMG,
-                    atkStats.Penetration,
-                    _stats.DamageReduction);
-            }
-            else
-            {
-                dmg = StatsCalculator.CalculateMagicDamage(
-                    atkStats.MATK * profile.DamageMultiplier,
-                    _stats.MDEF,
-                    crit,
-                    atkStats.CritDMG,
-                    atkStats.MagicPenetration,
-                    _stats.DamageReduction);
-            }
-
-            dmg = SanitizeDamage(dmg);
-            dmg = Mathf.Max(1f, dmg);
-
-            // SINCRONIZA ANIMAÇÃO DE ATAQUE PARA TODOS
-            if (!string.IsNullOrEmpty(profile.AnimTrigger))
-                attacker.RpcPlayAnimation(profile.AnimTrigger);
-
-            if (profile.UsesProjectile)
-            {
-                SpawnAttackProjectile(attacker, profile, dmg, crit);
-            }
-            else
-            {
-                CreditDamageToShooter(attacker.netId, dmg);
-                ApplyAggroReaction(attacker);
-                RpcShowDamage(dmg, crit, ImpactPoint);
-                ApplyDamageInternal(dmg);
-            }
-        }
-
-        [Server]
-        private WeaponAttackProfile ResolveServerWeaponProfile(NetworkInventory inventory)
-        {
-            if (inventory == null)
-                return WeaponAttackProfile.Default(WeaponType.Unarmed);
-
-            string weaponId = inventory.ServerGetEquipped(EquipmentSlot.Weapon);
-            if (string.IsNullOrEmpty(weaponId))
-                return WeaponAttackProfile.Default(WeaponType.Unarmed);
-
-            var item = ItemDatabase.Instance?.GetItem(weaponId);
-            if (item == null || !item.IsWeapon)
-                return WeaponAttackProfile.Default(WeaponType.Unarmed);
-
-            return item.GetEffectiveAttackProfile();
-        }
-
-        [Server]
-        private void SpawnAttackProjectile(NetworkPlayer attacker, WeaponAttackProfile profile,
-                                           float damage, bool crit)
-        {
-            var prefab = RPGNetworkManager.singleton?.GetProjectilePrefab(profile.Type);
-            if (prefab == null)
-            {
-                Debug.LogWarning($"[Combat] Sem prefab de projétil para {profile.Type}. " +
-                                 "Aplicando dano instantâneo como fallback.");
-                CreditDamageToShooter(attacker.netId, damage);
-                ApplyAggroReaction(attacker);
-                RpcShowDamage(damage, crit, ImpactPoint);
-                ApplyDamageInternal(damage);
-                return;
-            }
-
-            Vector3 spawnPos = attacker.transform.position
-                             + attacker.transform.forward * 0.5f
-                             + Vector3.up * 1.2f;
-            Quaternion spawnRot = Quaternion.LookRotation(
-                (ImpactPoint - spawnPos).normalized);
-
-            var go = Instantiate(prefab, spawnPos, spawnRot);
-            var proj = go.GetComponent<Projectile>();
-            if (proj == null)
-            {
-                Debug.LogError("[Combat] Projétil prefab não tem componente Projectile!");
-                Destroy(go);
-                CreditDamageToShooter(attacker.netId, damage);
-                ApplyAggroReaction(attacker);
-                RpcShowDamage(damage, crit, ImpactPoint);
-                ApplyDamageInternal(damage);
-                return;
-            }
-
-            NetworkServer.Spawn(go);
-            proj.ServerInitialize(this, attacker.netId, profile.ProjectileSpeed, damage, crit, _spawnGeneration);
-        }
-
-        private static long BuildBasicAttackCooldownKey(uint attackerNetId, uint monsterNetId)
-        {
-            return ((long)monsterNetId << 32) | attackerNetId;
-        }
-
-        [Server]
-        private void ApplyAggroReaction(NetworkPlayer attacker)
-        {
-            switch (disposition)
-            {
-                case MonsterDisposition.Passive:
-                    if (_state != AIState.Flee && _state != AIState.ReturnHome && _state != AIState.Dead)
-                    {
-                        _aggroTarget = attacker;
-                        _fleeTimer   = 0f;
-                        _state       = AIState.Flee;
-                        if (_agent != null) _agent.speed = _stats.MoveSpeed * fleeSpeedMult;
-                    }
-                    break;
-
-                case MonsterDisposition.Neutral:
-                    _wasAttacked = true;
-                    if (_state == AIState.Idle || _state == AIState.Patrol || _state == AIState.ReturnHome)
-                    {
-                        CancelPatrolWait();
-                        _aggroTarget       = attacker;
-                        _state             = AIState.Chase;
-                        float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-                        _attackAccumulator = ai * 0.3f;
-                    }
-                    break;
-
-                case MonsterDisposition.Aggressive:
-                    if (_state == AIState.Idle || _state == AIState.Patrol)
-                    {
-                        CancelPatrolWait();
-                        _aggroTarget       = attacker;
-                        _state             = AIState.Chase;
-                        float ai           = (_stats.ASPD > 0f) ? (1f / _stats.ASPD) : 1f;
-                        _attackAccumulator = ai * 0.3f;
-                    }
-                    break;
-            }
-        }
-
-        [Server]
-        private void ServerTakeDamageFromPlayer(
-            NetworkPlayer attacker, DerivedStats atkStats,
-            bool isPhysical, SkillData skill)
-        {
-            bool hit = StatsCalculator.RollHit(atkStats.HIT, _stats.FLEE);
-            if (!hit) { RpcShowMiss(transform.position); return; }
-
-            bool crit = StatsCalculator.RollCrit(atkStats.CRIT);
-            float dmg;
-
-            if (isPhysical)
-            {
-                dmg = StatsCalculator.CalculatePhysicalDamage(
-                    atkStats.ATK * skill.AtkMultiplier,
-                    _stats.DEF,
-                    crit,
-                    atkStats.CritDMG,
-                    atkStats.Penetration,
-                    _stats.DamageReduction);
-            }
-            else
-            {
-                dmg = StatsCalculator.CalculateMagicDamage(
-                    atkStats.MATK * skill.AtkMultiplier,
-                    _stats.MDEF,
-                    crit,
-                    atkStats.CritDMG,
-                    atkStats.MagicPenetration,
-                    _stats.DamageReduction);
-            }
-
-            dmg = SanitizeDamage(dmg);
-            dmg = Mathf.Max(1f, dmg);
-
-            CreditDamageToShooter(attacker.netId, dmg);
-
-            RpcShowDamage(dmg, crit, transform.position);
-            ApplyAggroReaction(attacker);
-            ApplyDamageInternal(dmg);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Morte e respawn
-        // ══════════════════════════════════════════════════════════════════
-
-        /// <summary>
-        /// FIX: guarda dupla de _deathProcessed no início do método.
-        /// Antes havia uma pequena janela onde dois hits simultâneos podiam
-        /// passar pelo if inicial se chegassem no mesmo frame, antes de
-        /// _deathProcessed ser definido como true.
-        /// </summary>
         [Server]
         private void ServerDie()
         {
-            // Dupla guarda: _deathProcessed é definido ANTES de qualquer trabalho
-            if (_deathProcessed) return;
+            if (DeathProcessed) return;
+
             Vector3 deathPos = transform.position;
-            _deathProcessed = true;
+            DeathProcessed   = true;
+            _isDead          = true;
+            _isMoving        = false;
 
-            _isDead   = true;
-            _isMoving = false;
-            _state    = AIState.Dead;
+            _ai?.ServerStop();
 
-            CancelAllAICoroutines();
+            _combat?.ServerDistributeRewardsAndDrops(deathPos);
+            _combat?.ServerStopAndClear();
 
-            // DESATIVA NAVMESH
-            if (_agent != null)
-            {
-                if (_agent.isOnNavMesh)
-                {
-                    _agent.ResetPath();
-                    _agent.velocity = Vector3.zero;
-                }
-                _agent.enabled = false;
-            }
+            RpcOnDied(deathPos);
 
-            // DESATIVA COLLIDER
-            Collider col = GetComponent<Collider>();
-            if (col != null)
-                col.enabled = false;
-
-            // TROCA LAYER PARA "Dead"
-            int deadLayer = LayerMask.NameToLayer("Dead");
-            if (deadLayer >= 0) gameObject.layer = deadLayer;
-
-            // DESATIVA NETWORK TRANSFORM
-            var nt = GetComponent<NetworkTransformUnreliable>();
-            if (nt != null)
-                nt.enabled = false;
-
-            ServerDistributeExp();
-
-            RPG.Managers.ItemDropManager.Instance?.ServerSpawnDrop(
-                deathPos + Vector3.up * 0.5f,
-                dropTable.Count > 0 ? dropTable : null,
-                guaranteedDropIds.Count > 0 ? guaranteedDropIds : null);
-
-            _deathSequenceCoroutine = StartCoroutine(ServerDeathSequence());
+            if (_deathHandler != null)
+                StartCoroutine(_deathHandler.RunDeathSequence(deathPos));
         }
 
+        // Cmds delegados — mantidos por compatibilidade com chamadores antigos
         [Server]
-        private void ServerDistributeExp()
-        {
-            if (_damageLog.Count == 0) return;
+        public void ServerTakeProjectileDamage(uint shooterNetId, float dmg, bool crit)
+            => _combat?.ServerTakeProjectileDamage(shooterNetId, dmg, crit);
 
-            float total = 0f;
-            foreach (var kv in _damageLog) total += kv.Value;
-            if (total <= 0f) return;
+        public void CmdRequestSkill(uint attackerNetId, int skillIndex, bool isPhysical)
+            => _combat?.CmdRequestSkill(attackerNetId, skillIndex, isPhysical);
 
-            foreach (var kv in _damageLog)
-            {
-                long xp = (long)Mathf.Max(1f, expReward * (kv.Value / total));
-                var  np = FindPlayerByNetId(kv.Key);
-
-                // FIX: distribui XP mesmo para jogadores mortos (que contribuíram com dano
-                // antes de morrer). Isso é mais justo e consistente com outros MMOs.
-                if (np == null) continue;
-
-                np.ServerGrantExp(xp);
-
-                if (_hasMonsterId)
-                {
-                    var qm = np.GetComponent<RPG.Quest.QuestManager>();
-                    qm?.NotifyEvent(RPG.Quest.QuestObjectiveType.KillMonster, monsterId, 1);
-                }
-            }
-            _damageLog.Clear();
-        }
-
-        [Server]
-        private IEnumerator ServerDeathSequence()
-        {
-            if (this == null) yield break;
-
-            RpcOnDied(transform.position);
-
-            // Aguarda o tempo do fade visual antes de sumir da rede
-            float fadeWait = bodyFadeDelay + bodyFadeDuration + 0.5f;
-            yield return new WaitForSeconds(fadeWait);
-
-            if (this != null && isServer)
-            {
-                // Notifica o spawner para agendar o respawn ANTES de destruir
-                if (_spawner != null && _monsterPrefab != null)
-                {
-                    _spawner.ServerNotifyDeath(_monsterPrefab, _homePosition, _patrolRadiusRuntime, respawnDelay);
-                }
-
-                // Destrói o monstro no servidor (isso removerá de todos os clientes automaticamente)
-                NetworkServer.Destroy(gameObject);
-            }
-        }
-
-        private bool TryGetRandomAreaPoint(Vector3 center, float radius, out Vector3 result)
-        {
-            for (int i = 0; i < 15; i++)
-            {
-                Vector2 r2 = Random.insideUnitCircle * radius;
-                Vector3 c  = center + new Vector3(r2.x, 0f, r2.y);
-                if (NavMesh.SamplePosition(c, out NavMeshHit hit, 3f, NavMesh.AllAreas))
-                { result = hit.position; return true; }
-            }
-            result = center;
-            return false;
-        }
+        public void CmdBasicAttack(uint attackerNetId, float clientAttackRange)
+            => _combat?.CmdBasicAttack(attackerNetId, clientAttackRange);
 
         // ══════════════════════════════════════════════════════════════════
-        // ClientRpcs
+        // ClientRpcs visuais (chamados pelo MonsterCombat)
         // ══════════════════════════════════════════════════════════════════
 
         [ClientRpc]
-        private void RpcShowDamage(float dmg, bool crit, Vector3 pos)
+        public void RpcShowDamageFloating(float dmg, bool crit, Vector3 pos)
         {
             if (Application.isBatchMode) return;
             FloatingTextManager.Instance?.Show(
@@ -1332,21 +326,21 @@ namespace RPG.Network
         }
 
         [ClientRpc]
-        private void RpcShowMiss(Vector3 pos)
+        public void RpcShowMiss(Vector3 pos)
         {
             if (Application.isBatchMode) return;
             FloatingTextManager.Instance?.Show("MISS", pos + Vector3.up * 0.5f, Color.gray);
         }
 
         [ClientRpc]
-        private void RpcPlayAnim(string trigger)
+        public void RpcPlayAnim(string trigger)
         {
             if (Application.isBatchMode) return;
             _animator?.SetTrigger(trigger);
         }
 
         [ClientRpc]
-        private void RpcShowDamageTakenOnPlayer(float dmg, bool crit, Vector3 playerPos)
+        public void RpcShowDamageTakenOnPlayer(float dmg, bool crit, Vector3 playerPos)
         {
             if (Application.isBatchMode) return;
             FloatingTextManager.Instance?.Show(
@@ -1377,118 +371,78 @@ namespace RPG.Network
             }
 
             FloatingTextManager.Instance?.Show("Morto!", pos + Vector3.up, Color.red);
-
-            if (_clientFadeCoroutine != null) StopCoroutine(_clientFadeCoroutine);
-            _clientFadeCoroutine = StartCoroutine(ClientDeathFadeSequence());
-        }
-
-        private IEnumerator ClientDeathFadeSequence()
-        {
-            yield return new WaitForSeconds(bodyFadeDelay);
-            if (this == null) yield break;
-
-            Renderer[] renderers = null;
-            if (visualRoot != null)
-                renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
-
-            if (renderers != null && renderers.Length > 0)
-            {
-                _fadeMaterialInstances = new List<Material>();
-
-                foreach (var r in renderers)
-                {
-                    if (r == null) continue;
-                    var mats = r.materials;
-                    foreach (var mat in mats)
-                    {
-                        if (mat == null) continue;
-                        _fadeMaterialInstances.Add(mat);
-
-                        if (mat.HasProperty("_Mode"))
-                        {
-                            mat.SetFloat("_Mode", 2f);
-                            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-                            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-                            mat.SetInt("_ZWrite", 0);
-                            mat.DisableKeyword("_ALPHATEST_ON");
-                            mat.EnableKeyword("_ALPHABLEND_ON");
-                            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-                            mat.renderQueue = 3000;
-                        }
-                        if (mat.HasProperty("_Surface"))
-                            mat.SetFloat("_Surface", 1f);
-                    }
-                    r.materials = mats;
-                }
-
-                var propBlock = new MaterialPropertyBlock();
-                float elapsed = 0f;
-
-                while (elapsed < bodyFadeDuration)
-                {
-                    if (this == null) yield break;
-
-                    elapsed += Time.deltaTime;
-                    float alpha = Mathf.Lerp(1f, 0f, elapsed / bodyFadeDuration);
-
-                    foreach (var r in renderers)
-                    {
-                        if (r == null) continue;
-                        r.GetPropertyBlock(propBlock);
-                        propBlock.SetColor("_Color",     new Color(1f, 1f, 1f, alpha));
-                        propBlock.SetColor("_BaseColor", new Color(1f, 1f, 1f, alpha));
-                        r.SetPropertyBlock(propBlock);
-                    }
-                    yield return null;
-                }
-            }
-
-            if (this != null && visualRoot != null)
-                visualRoot.SetActive(false);
-
-            ReleaseFadeMaterials();
-            _clientFadeCoroutine = null;
-        }
-
-        private void ReleaseFadeMaterials()
-        {
-            if (_fadeMaterialInstances == null) return;
-            foreach (var mat in _fadeMaterialInstances)
-                if (mat != null) Destroy(mat);
-            _fadeMaterialInstances = null;
-        }
-
-        private void RestoreVisualsAlpha()
-        {
-            if (visualRoot == null) return;
-            var renderers = visualRoot.GetComponentsInChildren<Renderer>(true);
-            foreach (var r in renderers)
-                if (r != null) r.SetPropertyBlock(null);
+            _fader?.BeginFade();
         }
 
         [ClientRpc]
-        private void RpcOnRespawned()
+        public void RpcPlayHitEffects()
         {
             if (Application.isBatchMode) return;
-
-            if (_clientFadeCoroutine != null)
-            {
-                StopCoroutine(_clientFadeCoroutine);
-                _clientFadeCoroutine = null;
-            }
-
-            ReleaseFadeMaterials();
-            RestoreVisualsAlpha();
-
-            if (visualRoot)         visualRoot.SetActive(true);
-            if (selectionIndicator) selectionIndicator.SetActive(false);
-
-            if (healthBarUI)
-            {
-                healthBarUI.gameObject.SetActive(true);
-                healthBarUI.UpdateBar(_currentHP, _maxHP);
-            }
+            if (_hitFlashCoroutine != null) StopCoroutine(_hitFlashCoroutine);
+            _hitFlashCoroutine = StartCoroutine(HitFlashRoutine());
         }
+
+        private IEnumerator HitFlashRoutine()
+        {
+            if (_renderers == null || _renderers.Count == 0) yield break;
+
+            // --- Knockback Visual (Client-side) ---
+            Vector3 originalVisualPos = visualRoot != null ? visualRoot.transform.localPosition : Vector3.zero;
+            if (visualRoot != null)
+            {
+                // Move o visual um pouco para trás e para cima
+                visualRoot.transform.localPosition = originalVisualPos - Vector3.forward * 0.1f + Vector3.up * 0.05f;
+            }
+
+            // Armazena cores originais e seta para branco
+            Dictionary<Renderer, Color[]> originalColors = new Dictionary<Renderer, Color[]>();
+            foreach (var r in _renderers)
+            {
+                if (r == null) continue;
+                var mats = r.materials;
+                Color[] colors = new Color[mats.Length];
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    if (mats[i].HasProperty("_Color"))
+                    {
+                        colors[i] = mats[i].color;
+                        mats[i].color = _hitColor;
+                    }
+                    else if (mats[i].HasProperty("_BaseColor"))
+                    {
+                        colors[i] = mats[i].GetColor("_BaseColor");
+                        mats[i].SetColor("_BaseColor", _hitColor);
+                    }
+                }
+                originalColors[r] = colors;
+            }
+
+            yield return new WaitForSeconds(0.08f);
+
+            // Restaura posição visual
+            if (visualRoot != null) visualRoot.transform.localPosition = originalVisualPos;
+
+            // Restaura cores originais
+            foreach (var kvp in originalColors)
+            {
+                var r = kvp.Key;
+                if (r == null) continue;
+                var mats = r.materials;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    if (mats[i].HasProperty("_Color"))
+                        mats[i].color = kvp.Value[i];
+                    else if (mats[i].HasProperty("_BaseColor"))
+                        mats[i].SetColor("_BaseColor", kvp.Value[i]);
+                }
+            }
+
+            _hitFlashCoroutine = null;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // SyncVar hooks
+        // ══════════════════════════════════════════════════════════════════
 
         private void OnCurrentHPChanged(float _, float v)
         {
@@ -1517,38 +471,5 @@ namespace RPG.Network
             if (Application.isBatchMode) return;
             _animator?.SetBool("IsMoving", moving);
         }
-
-        private void OnDestroy()
-        {
-            ReleaseFadeMaterials();
-        }
-
-#if UNITY_EDITOR
-        private void OnDrawGizmosSelected()
-        {
-            Gizmos.color = disposition switch
-            {
-                MonsterDisposition.Passive => Color.green,
-                MonsterDisposition.Neutral => Color.yellow,
-                _                          => Color.red
-            };
-            Gizmos.DrawWireSphere(transform.position, aggroRange);
-
-            Gizmos.color = new Color(1f, 0.3f, 0.3f);
-            Gizmos.DrawWireSphere(transform.position, attackRange);
-
-            Gizmos.color = new Color(0f, 1f, 0.5f, 0.5f);
-            Gizmos.DrawWireSphere(transform.position, attackRange * CHASE_DEST_FRACTION);
-
-            Gizmos.color = Color.blue;
-            Gizmos.DrawWireSphere(transform.position, attackRange * kiteDistanceFraction);
-
-            Gizmos.color = new Color(1f, 1f, 1f, 0.4f);
-            Gizmos.DrawWireSphere(transform.position, leashRange);
-
-            UnityEditor.Handles.Label(transform.position + Vector3.up * 2f,
-                $"Lv{level} | HP:{_maxHP:0} ATK:{_stats?.ATK:0} DEF:{_stats?.DEF:0}");
-        }
-#endif
     }
 }

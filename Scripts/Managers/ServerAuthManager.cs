@@ -7,7 +7,6 @@ using System.Collections;
 
 namespace RPG.Network
 {
-
     public class ServerAuthManager : MonoBehaviour
     {
         public static ServerAuthManager Instance { get; private set; }
@@ -18,8 +17,8 @@ namespace RPG.Network
 
         private const int MAX_USERNAME_PAYLOAD_BYTES = 64;
         private const int MAX_HASH_PAYLOAD_BYTES     = 256;
-        private const int MAX_TRACKED_IPS            = 10_000;
         private const int MAX_TRACKED_SESSIONS       = 5_000;
+        private const float CLEANUP_INTERVAL         = 60f;
 
         private enum ConnState { Unauthenticated, Authenticated, InGame }
 
@@ -38,24 +37,15 @@ namespace RPG.Network
             public ConnData() => LastActivityTime = Time.time;
         }
 
-        private class IpData
-        {
-            public int   FailedAttempts;
-            public float BanUntil;
-            public float LastAttemptTime;
-        }
+        private readonly Dictionary<int, ConnData> _sessions = new();
 
-        private readonly Dictionary<int, ConnData>    _sessions       = new();
-        private readonly Dictionary<string, IpData>   _ipBans         = new();
+        // Mapeia username (lowercase) → connectionId que está usando essa conta
+        private readonly Dictionary<string, int> _loggedAccounts = new();
 
-        // ── PROTEÇÃO CONTRA LOGIN DUPLO ────────────────────────────────────
-        // Mapeia username (lowercase) → connectionId que está usando essa conta.
-        // Quando a conexão cai (OnServerDisconnect), o username é removido.
-        private readonly Dictionary<string, int>      _loggedAccounts = new();
+        // Tracking de IPs delegado a IpBanTracker
+        private readonly IpBanTracker _ipTracker = new IpBanTracker();
 
         private Coroutine _cleanupCoroutine;
-
-        private const float CLEANUP_INTERVAL = 60f;
 
         private void Awake()
         {
@@ -86,7 +76,7 @@ namespace RPG.Network
                 ? "unknown"
                 : conn.address;
 
-            if (IsIpBanned(remoteAddress))
+            if (_ipTracker.IsBanned(remoteAddress))
             {
                 Debug.LogWarning($"[ServerAuth] IP banido tentou conectar: {remoteAddress}");
                 conn.Send(new MsgLoginResponse
@@ -120,10 +110,6 @@ namespace RPG.Network
         {
             if (_sessions.TryGetValue(conn.connectionId, out var session))
             {
-                // ── LIBERA O SLOT DA CONTA AO DESCONECTAR ─────────────────
-                // Independente do estado (Authenticated ou InGame), se havia
-                // um username associado, remove do dicionário de contas logadas
-                // para que o jogador possa entrar novamente.
                 if (!string.IsNullOrEmpty(session.Username))
                 {
                     string key = session.Username.ToLower();
@@ -172,7 +158,7 @@ namespace RPG.Network
             if (session.LoginAttempts > GameConstants.Auth.LOGIN_MAX_PER_CONN)
             {
                 Debug.LogWarning($"[ServerAuth] SECURITY: conn:{conn.connectionId} excedeu tentativas.");
-                RecordFailedLoginAttempt(session.RemoteAddress);
+                _ipTracker.RecordFailedAttempt(session.RemoteAddress);
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Muitas tentativas. Tente mais tarde." });
                 conn.Disconnect();
                 return;
@@ -188,7 +174,7 @@ namespace RPG.Network
                 || msg.SignedHash.Length > MAX_HASH_PAYLOAD_BYTES)
             {
                 Debug.LogWarning($"[ServerAuth] SECURITY: payload anormal de {session.RemoteAddress}");
-                RecordFailedLoginAttempt(session.RemoteAddress);
+                _ipTracker.RecordFailedAttempt(session.RemoteAddress);
                 conn.Send(new MsgLoginResponse { Success = false, Error = "Dados inválidos." });
                 conn.Disconnect();
                 return;
@@ -201,15 +187,11 @@ namespace RPG.Network
                 return;
             }
 
-            // ── VERIFICAÇÃO DE CONTA JÁ LOGADA ────────────────────────────
-            // Antes de consultar o banco, verifica se alguém já está usando
-            // esta conta. Se sim, rejeita imediatamente.
+            // Verifica se conta já está logada
             string usernameLower = msg.Username.Trim().ToLower();
             if (_loggedAccounts.TryGetValue(usernameLower, out int existingConnId))
             {
-                // Verifica se a conexão registrada ainda está ativa
                 bool existingStillActive = NetworkServer.connections.ContainsKey(existingConnId);
-
                 if (existingStillActive)
                 {
                     Debug.LogWarning($"[ServerAuth] SECURITY: conta '{msg.Username}' já está logada " +
@@ -223,7 +205,6 @@ namespace RPG.Network
                 }
                 else
                 {
-                    // Conexão antiga não existe mais — limpa o registro órfão
                     _loggedAccounts.Remove(usernameLower);
                     LogAuth($"Registro órfão de conta '{msg.Username}' removido (connId={existingConnId} não existe mais).");
                 }
@@ -236,7 +217,7 @@ namespace RPG.Network
 
             if (!result.Success)
             {
-                RecordFailedLoginAttempt(session.RemoteAddress);
+                _ipTracker.RecordFailedAttempt(session.RemoteAddress);
 
                 string attempts = $"({session.LoginAttempts}/{GameConstants.Auth.LOGIN_MAX_PER_CONN})";
                 var failMsg = new MsgLoginResponse
@@ -252,7 +233,7 @@ namespace RPG.Network
                 return;
             }
 
-            // ── REGISTRA A CONTA COMO LOGADA ──────────────────────────────
+            // Registra como logada
             _loggedAccounts[usernameLower] = conn.connectionId;
 
             session.State            = ConnState.Authenticated;
@@ -261,7 +242,7 @@ namespace RPG.Network
             session.LoginAttempts    = 0;
             session.LastActivityTime = Time.time;
 
-            ClearIpFailures(session.RemoteAddress);
+            _ipTracker.ClearFailures(session.RemoteAddress);
 
             conn.Send(new MsgLoginResponse { Success = true, Username = result.Account.Username });
             SendCharacterList(conn, result.Account);
@@ -279,112 +260,9 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Rate limit por IP
+        // Cleanup de sessões
         // ══════════════════════════════════════════════════════════════════
 
-        private bool IsIpBanned(string ip)
-        {
-            if (string.IsNullOrEmpty(ip) || ip == "unknown") return false;
-            if (!_ipBans.TryGetValue(ip, out var data)) return false;
-            return Time.time < data.BanUntil;
-        }
-
-        private void RecordFailedLoginAttempt(string ip)
-        {
-            if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
-
-            if (!_ipBans.ContainsKey(ip) && _ipBans.Count >= MAX_TRACKED_IPS)
-            {
-                EvictLeastRecentIps(targetSize: MAX_TRACKED_IPS - (MAX_TRACKED_IPS / 10));
-
-                if (_ipBans.Count >= MAX_TRACKED_IPS)
-                {
-                    Debug.LogError("[ServerAuth] SECURITY: _ipBans cheio mesmo após eviction. " +
-                                   "IP novo NÃO trackado. Sob ataque massivo?");
-                    return;
-                }
-            }
-
-            if (!_ipBans.TryGetValue(ip, out var data))
-            {
-                data = new IpData();
-                _ipBans[ip] = data;
-            }
-
-            data.FailedAttempts++;
-            data.LastAttemptTime = Time.time;
-
-            if (data.FailedAttempts >= GameConstants.Auth.LOGIN_MAX_PER_IP)
-            {
-                data.BanUntil = Time.time + GameConstants.Auth.IP_BAN_DURATION_SECONDS;
-                Debug.LogWarning($"[ServerAuth] SECURITY [{System.DateTime.UtcNow:o}]: " +
-                                 $"IP banido por brute-force: {ip} " +
-                                 $"({data.FailedAttempts} falhas, ban por " +
-                                 $"{GameConstants.Auth.IP_BAN_DURATION_SECONDS}s)");
-            }
-        }
-
-        private void ClearIpFailures(string ip)
-        {
-            if (string.IsNullOrEmpty(ip) || ip == "unknown") return;
-            _ipBans.Remove(ip);
-        }
-
-        private void EvictLeastRecentIps(int targetSize)
-        {
-            if (_ipBans.Count <= targetSize) return;
-
-            float now      = Time.time;
-            int toRemove   = _ipBans.Count - targetSize;
-
-            var inactiveCandidates = new List<KeyValuePair<string, float>>(_ipBans.Count);
-            foreach (var kv in _ipBans)
-            {
-                if (now >= kv.Value.BanUntil)
-                    inactiveCandidates.Add(new KeyValuePair<string, float>(kv.Key, kv.Value.LastAttemptTime));
-            }
-            inactiveCandidates.Sort((a, b) => a.Value.CompareTo(b.Value));
-
-            int removed = 0;
-            foreach (var c in inactiveCandidates)
-            {
-                if (removed >= toRemove) break;
-                _ipBans.Remove(c.Key);
-                removed++;
-            }
-
-            if (removed > 0)
-                Debug.Log($"[ServerAuth] Eviction LRU fase 1: removeu {removed} IPs inativos do tracker.");
-
-            int stillToRemove = toRemove - removed;
-            if (stillToRemove <= 0) return;
-
-            var activeBans = new List<KeyValuePair<string, float>>(_ipBans.Count);
-            foreach (var kv in _ipBans)
-            {
-                if (now < kv.Value.BanUntil)
-                    activeBans.Add(new KeyValuePair<string, float>(kv.Key, kv.Value.LastAttemptTime));
-            }
-            activeBans.Sort((a, b) => a.Value.CompareTo(b.Value));
-
-            int activeRemoved = 0;
-            foreach (var c in activeBans)
-            {
-                if (activeRemoved >= stillToRemove) break;
-                _ipBans.Remove(c.Key);
-                activeRemoved++;
-            }
-
-            if (activeRemoved > 0)
-                Debug.LogWarning($"[ServerAuth] SECURITY: eviction LRU fase 2 removeu " +
-                                 $"{activeRemoved} bans ATIVOS antigos (proteção contra DoS de memória). " +
-                                 "IPs evictados serão re-banidos se continuarem atacando.");
-        }
-
-        /// <summary>
-        /// Limpeza forçada de sessões não-InGame expiradas.
-        /// Não remove sessões InGame — essas saem em OnServerDisconnect.
-        /// </summary>
         private void ForceCleanupSessions()
         {
             float now    = Time.time;
@@ -401,7 +279,6 @@ namespace RPG.Network
 
             foreach (var id in toRemove)
             {
-                // Libera conta se havia username registrado
                 var s = _sessions[id];
                 if (!string.IsNullOrEmpty(s.Username))
                 {
@@ -648,18 +525,16 @@ namespace RPG.Network
         {
             var wait            = new WaitForSeconds(CLEANUP_INTERVAL);
             var expiredSessions = new List<int>();
-            var expiredIps      = new List<string>();
 
             while (true)
             {
                 yield return wait;
 
+                // Sessões expiradas
                 expiredSessions.Clear();
                 foreach (var kv in _sessions)
                 {
-                    // Sessões InGame saem em OnServerDisconnect — não limpar aqui.
                     if (kv.Value.State == ConnState.InGame) continue;
-
                     if (Time.time - kv.Value.LastActivityTime > GameConstants.Auth.SESSION_TTL_SECONDS)
                         expiredSessions.Add(kv.Key);
                 }
@@ -667,7 +542,6 @@ namespace RPG.Network
                 {
                     var s = _sessions[id];
 
-                    // Libera conta se havia username registrado
                     if (!string.IsNullOrEmpty(s.Username))
                     {
                         string key = s.Username.ToLower();
@@ -679,24 +553,10 @@ namespace RPG.Network
                     Debug.Log($"[ServerAuthManager] Sessão expirada removida: connId={id} estado={s.State}");
                 }
 
-                expiredIps.Clear();
-                foreach (var kv in _ipBans)
-                {
-                    var data = kv.Value;
-                    if (Time.time >= data.BanUntil
-                        && Time.time - data.LastAttemptTime > GameConstants.Auth.IP_BAN_DURATION_SECONDS)
-                        expiredIps.Add(kv.Key);
-                }
-                foreach (var ip in expiredIps)
-                    _ipBans.Remove(ip);
+                // IPs expirados — delegado a IpBanTracker
+                _ipTracker.RunPeriodicCleanup();
 
-                if (_ipBans.Count > MAX_TRACKED_IPS)
-                    EvictLeastRecentIps(targetSize: MAX_TRACKED_IPS - (MAX_TRACKED_IPS / 10));
-
-                // ── LIMPEZA DE CONTAS LOGADAS ÓRFÃS ───────────────────────
-                // Verifica se algum connId em _loggedAccounts não existe mais
-                // como conexão ativa. Isso é uma rede de segurança extra — em
-                // condições normais OnServerDisconnect já cuida disso.
+                // Limpeza de contas órfãs (rede de segurança extra)
                 var orphanedAccounts = new List<string>();
                 foreach (var kv in _loggedAccounts)
                 {
@@ -712,22 +572,15 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // API pública — utilitário de debug/admin (opcional)
+        // API pública — utilitário de debug/admin
         // ══════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Retorna true se a conta (username) está atualmente logada.
-        /// Útil para sistemas de admin ou debug.
-        /// </summary>
         public bool IsAccountOnline(string username)
         {
             if (string.IsNullOrEmpty(username)) return false;
             return _loggedAccounts.ContainsKey(username.ToLower());
         }
 
-        /// <summary>
-        /// Força o kick de uma conta pelo username (para uso admin/anti-cheat).
-        /// </summary>
         public void KickAccount(string username, string reason = "Desconectado pelo servidor.")
         {
             if (string.IsNullOrEmpty(username)) return;
@@ -743,7 +596,6 @@ namespace RPG.Network
             }
             else
             {
-                // Conexão não existe mais — remove o registro órfão
                 _loggedAccounts.Remove(key);
             }
         }

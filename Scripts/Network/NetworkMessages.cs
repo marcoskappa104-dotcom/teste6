@@ -116,4 +116,52 @@ namespace RPG.Network
     /// Só então o servidor spawna o player (garante NavMesh pronto).
     /// </summary>
     public struct MsgClientSceneReady : NetworkMessage { }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Chat
+    // ══════════════════════════════════════════════════════════════════════
+
+    public enum ChatChannel { Global, Party, System }
+
+    public struct MsgChatMessage : NetworkMessage
+    {
+        public ChatChannel Channel;
+        public string      SenderName;
+        public string      Text;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Grupo (Party)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public struct MsgPartyInviteRequest : NetworkMessage
+    {
+        public string TargetName;
+    }
+
+    public struct MsgPartyInviteReceived : NetworkMessage
+    {
+        public uint   InviterNetId;
+        public string InviterName;
+    }
+
+    public struct MsgPartyInviteResponse : NetworkMessage
+    {
+        public uint   InviterNetId;
+        public bool   Accept;
+    }
+
+    public struct MsgPartyUpdate : NetworkMessage
+    {
+        public List<PartyMemberData> Members;
+    }
+
+    public struct PartyMemberData
+    {
+        public uint   NetId;
+        public string Name;
+        public int    Level;
+        public float  HpPercent;
+        public bool   IsLeader;
+    }
 }
